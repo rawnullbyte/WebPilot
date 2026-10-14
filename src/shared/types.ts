@@ -26,8 +26,6 @@ export type Settings = {
   apiKey: string
   model: string
   temperature: number
-  /** Hard ceiling on agent steps before it gives up. */
-  maxSteps: number
   approval: ApprovalMode
   /**
    * Whether to attach a screenshot of the page (with interactive elements

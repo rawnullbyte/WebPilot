@@ -201,7 +201,11 @@ City Check in Guests …
 
 The model replies by calling a tool — `click`, `type`, `select_option`, `scroll`
 and so on — and WebPilot performs it and reports back what happened. The loop runs
-until the model calls `finish`, or hits the step limit.
+until the model calls `finish`, or you stop it. There is no step limit: a long
+task legitimately takes many actions, and being cut off part-way through one is
+worse than the thing a cap protects against. The guards that remain target the
+actual failure modes — making the same call three times over, or failing five
+times in a row — rather than an arbitrary count.
 
 **Iframes are read too.** A form inside an embedded frame is a separate document,
 so it gets its own prefix: `f3:n4` is element 4 in frame 3. The agent treats all

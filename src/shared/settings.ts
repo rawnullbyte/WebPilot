@@ -41,7 +41,6 @@ export const DEFAULT_SETTINGS: Settings = {
   apiKey: '',
   model: '',
   temperature: 0.2,
-  maxSteps: 25,
   // The user asked to start fully autonomous; every mode stays available in
   // Settings and can be changed per task.
   approval: 'auto',

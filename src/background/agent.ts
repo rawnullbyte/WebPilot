@@ -508,18 +508,29 @@ export class Agent {
     const recentCalls: string[] = []
 
     try {
-      for (let step = 0; step < settings.maxSteps; step++) {
+      /*
+       * No step limit.
+       *
+       * The loop runs until the model calls `finish`, or the user stops it. A cap
+       * was the wrong guard: a long task — paging through results, filling a
+       * large form — legitimately takes many actions, and being cut off part-way
+       * through one is worse than the thing the cap was protecting against. The
+       * failure modes that a cap would have caught are already handled more
+       * precisely by the ones that remain:
+       *
+       *  - going in circles: the repeat detector below catches the same call made
+       *    three times over, which is the actual shape of being stuck;
+       *  - cascading breakage: `consecutiveFailures` stops after five failures in
+       *    a row, which is the actual shape of losing the thread;
+       *  - and cost: Stop is always available, and the cost of a runaway loop is
+       *    visible in the transcript as it happens rather than discovered at a
+       *    hard boundary some time after it went wrong.
+       *
+       * `step` is still counted, for the repeat detector's step numbering.
+       */
+      for (let step = 0; ; step++) {
         if (abort.signal.aborted) return void this.finishStopped(session)
 
-        /*
-         * No step counter in the status.
-         *
-         * It re-rendered on every turn, so the pill flickered through "Step 1 of
-         * 25 … Step 2 of 25 …" the whole time — changing many times a second
-         * worth of reading, and saying nothing the transcript did not already
-         * show. The step limit still stops the run and is still reported in the
-         * message when it is reached; it just is not narrated continuously.
-         */
         this.setStatus(session, 'working')
         // A new turn: fresh streaming text, and a new group in the transcript.
         this.turnCounters.set(tabId, (this.turnCounters.get(tabId) ?? 0) + 1)
@@ -685,14 +696,13 @@ export class Agent {
         }
       }
 
-      this.addMessage(
-        session,
-        'assistant',
-        `I stopped after ${settings.maxSteps} actions without finishing. ` +
-          'The task may need more steps — you can raise the limit in Settings — or I may be going in circles. ' +
-          `Here is where I got to: ${session.steps.slice(-3).map((s) => s.title).join('; ')}`,
-      )
-      this.setStatus(session, 'error', 'Step limit reached')
+      /*
+       * Unreachable by design: the loop above only exits by returning, from
+       * `finish`, from a stop, or by throwing. Kept as a safety net so a future
+       * edit that adds a `break` cannot fall out of the run silently, leaving the
+       * session stuck on "working".
+       */
+      this.setStatus(session, 'done', 'Finished')
     } catch (err) {
       if (this.isStopped(abort, err)) return void this.finishStopped(session)
       const message = err instanceof Error ? err.message : String(err)

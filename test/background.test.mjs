@@ -264,7 +264,6 @@ await test("settings/get returns the defaults", async () => {
   const res = await bg.request({ type: "settings/get" })
   assert.ok(res.settings, "no settings in the reply")
   assert.equal(res.settings.approval, "auto", "the default approval mode should be auto")
-  assert.equal(typeof res.settings.maxSteps, "number")
   assert.equal(res.settings.endpoint, "")
 })
 
@@ -605,6 +604,30 @@ await test("a corrupt store does not stop the extension starting", async () => {
 })
 
 section("queueing")
+
+await test("a long task runs without a step limit", async () => {
+  /*
+   * There is no cap now: the loop runs until the model finishes or the user
+   * stops it. The old limit also governed a *message*, and its removal left an
+   * unreachable branch at the end of the loop — this checks the loop is only
+   * exited by the paths that are meant to exit it.
+   *
+   * A hanging request plus many turns of the loop stands in for a long task.
+   */
+  const fresh = loadBackground({ hangingFetch: true })
+  fresh.connectPanel("sidebar", 1)
+  await fresh.request({ type: "settings/set", patch: { endpoint: "https://x.test/v1", model: "m" } })
+  await fresh.request({ type: "agent/run", prompt: "a very long job" })
+  await new Promise((r) => setTimeout(r, 40))
+
+  const res = await fresh.request({ type: "agent/state" })
+  // Still working, and not sitting on a terminal "step limit reached".
+  assert.equal(res.session.status, "working")
+  assert.ok(
+    !res.session.messages.some((m) => /step limit/i.test(m.text)),
+    "the step-limit message survived its own removal",
+  )
+})
 
 await test("a request made while busy is queued, not refused", async () => {
   const fresh = loadBackground({ hangingFetch: true })

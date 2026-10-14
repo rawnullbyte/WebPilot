@@ -358,15 +358,6 @@ export function Options() {
 
               <div className="grid gap-4 sm:grid-cols-2">
                 <NumberField
-                  id="maxSteps"
-                  label="Maximum actions per task"
-                  value={settings.maxSteps}
-                  min={1}
-                  max={200}
-                  hint="The agent stops here even if it has not finished."
-                  onChange={(v) => update({ maxSteps: v })}
-                />
-                <NumberField
                   id="temperature"
                   label="Temperature"
                   value={settings.temperature}

@@ -53,7 +53,6 @@ const SETTINGS = {
   model: "test-model",
   temperature: 0,
   extraHeaders: "",
-  maxSteps: 10,
   approval: "auto",
   vision: false,
   systemPrompt: "",
