@@ -125,22 +125,37 @@ export class Agent {
            */
           const interrupted = stored.status === 'working' || stored.status === 'waiting'
 
-          const steps = interrupted
-            ? [
-                ...stored.steps,
-                {
-                  id: `s${stored.tabId}_interrupted`,
-                  turn: 0,
-                  index: 0,
-                  at: Date.now(),
-                  kind: 'error' as const,
-                  title: 'Interrupted — the browser restarted WebPilot',
-                  detail:
-                    'The task stopped part-way. Nothing is running now; send a message to continue, or start over.',
-                  ok: false,
-                },
-              ]
-            : stored.steps
+          /*
+           * One notice, not one per restart.
+           *
+           * A run that stalls is saved as still running, so every start reports
+           * it as interrupted and appends another notice — and each notice is
+           * persisted, so they stack up and the transcript fills with the same
+           * line repeated. If the last thing already says the session was
+           * interrupted, say nothing more; the state is unchanged and so is the
+           * message.
+           */
+          const alreadyNoted =
+            stored.steps.length > 0 &&
+            /interrupted/i.test(stored.steps[stored.steps.length - 1].title)
+
+          const steps =
+            interrupted && !alreadyNoted
+              ? [
+                  ...stored.steps,
+                  {
+                    id: `s${stored.tabId}_interrupted_${Date.now()}`,
+                    turn: 0,
+                    index: 0,
+                    at: Date.now(),
+                    kind: 'error' as const,
+                    title: 'Interrupted — WebPilot was restarted mid-task',
+                    detail:
+                      'Nothing is running now. Send a message to continue, or start over.',
+                    ok: false,
+                  },
+                ]
+              : stored.steps
 
           this.sessions.set(stored.tabId, {
             tabId: stored.tabId,

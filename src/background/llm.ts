@@ -81,6 +81,13 @@ function describeFailure(err: unknown, s: Settings): LlmError {
   if (err instanceof DOMException && err.name === 'AbortError') {
     return new LlmError('Stopped.')
   }
+  if (err instanceof DOMException && err.name === 'TimeoutError') {
+    return new LlmError(
+      'The endpoint stopped responding.',
+      undefined,
+      'It accepted the request and then sent nothing for a while. It may be overloaded, or the model may have crashed — try again, or pick a smaller model.',
+    )
+  }
   if (/failed to fetch|networkerror|load failed/i.test(msg)) {
     const local = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0|host\.docker\.internal)/i
       .test(normalizeEndpoint(s.endpoint))
@@ -254,6 +261,74 @@ export type ChatOptions = {
    * five-second pause you can read.
    */
   onReasoning?: (text: string) => void
+  /**
+   * Abort if nothing arrives for this long, in milliseconds.
+   *
+   * A *stall* timeout, not a total-duration cap: the clock resets on every chunk,
+   * so a long answer that keeps streaming is never cut short while a request that
+   * has silently died is. This is the distinction that matters for a streamed
+   * response — capping total duration would kill a legitimate five-minute
+   * generation, and capping nothing kills the agent instead.
+   *
+   * Without this the agent's request had no timeout at all. A stalled endpoint
+   * left the run parked on a promise forever: the status stayed "working", the
+   * loop never unwound, and the panel sat on "Working…" with a Stop button that
+   * aborted a controller the loop had long since stopped watching. The session
+   * was then saved as still running, the background was suspended, and the next
+   * start reported it as interrupted — repeatedly, which is the loop this fixes.
+   */
+  stallMs?: number
+}
+
+/**
+ * Why a request ended: a stall, or a deliberate stop.
+ *
+ * The caller's signal and the watchdog's are combined into one, so the *reason*
+ * is what distinguishes them — and the difference matters, because telling
+ * someone their request stalled when they pressed Stop would be wrong.
+ */
+function abortReason(signal: AbortSignal): LlmError {
+  if (signal.reason instanceof DOMException && signal.reason.name === 'TimeoutError') {
+    return new LlmError(
+      'The endpoint stopped responding.',
+      undefined,
+      'It accepted the request and then sent nothing for a while. It may be overloaded, or the model may have crashed — try again, or pick a smaller model.',
+    )
+  }
+  return new LlmError('Stopped.')
+}
+
+/** Default stall timeout: long enough for a slow local model to start talking. */
+const DEFAULT_STALL_MS = 90_000
+
+/**
+ * Aborts when `stallMs` passes with no activity.
+ *
+ * `bump()` restarts the clock and is called for every chunk received, which is
+ * what makes this a stall detector rather than a deadline.
+ */
+function createStallWatch(stallMs: number): { signal: AbortSignal, bump: () => void, stop: () => void } {
+  const controller = new AbortController()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const arm = () => {
+    if (timer) clearTimeout(timer)
+    timer = setTimeout(
+      () =>
+        controller.abort(
+          new DOMException(`No response for ${Math.round(stallMs / 1000)}s`, 'TimeoutError'),
+        ),
+      stallMs,
+    )
+  }
+  arm()
+  return {
+    signal: controller.signal,
+    bump: arm,
+    stop: () => {
+      if (timer) clearTimeout(timer)
+      timer = undefined
+    },
+  }
 }
 
 /**
@@ -279,6 +354,14 @@ export async function chat(s: Settings, opts: ChatOptions): Promise<ChatResult> 
     body.tool_choice = 'auto'
   }
 
+  /*
+   * The caller's signal governs a deliberate stop; the watchdog governs a
+   * request that has died on its own. Both have to be able to end the request,
+   * so they are combined rather than one replacing the other.
+   */
+  const stall = createStallWatch(opts.stallMs ?? DEFAULT_STALL_MS)
+  const signal = AbortSignal.any([opts.signal, stall.signal])
+
   try {
     const res = await fetchWithRetry(
       () =>
@@ -286,10 +369,12 @@ export async function chat(s: Settings, opts: ChatOptions): Promise<ChatResult> 
           method: 'POST',
           headers: headers(s),
           body: JSON.stringify(body),
-          signal: opts.signal,
+          signal,
         }),
-      opts.signal,
+      signal,
     )
+    // Headers arrived, so the endpoint is alive; the per-chunk clock takes over.
+    stall.bump()
 
     if (!res.ok) {
       throw describeStatus(res.status, await res.text())
@@ -299,12 +384,24 @@ export async function chat(s: Settings, opts: ChatOptions): Promise<ChatResult> 
     // type rather than assuming, and handle both.
     const ctype = res.headers.get('content-type') ?? ''
     if (!res.body || !ctype.includes('text/event-stream')) {
-      return parseNonStreaming(await res.json(), opts.onToken, opts.onReasoning)
+      const parsed = parseNonStreaming(await res.json(), opts.onToken, opts.onReasoning)
+      stall.stop()
+      return parsed
     }
 
-    return await parseStreaming(res.body, opts.onToken, opts.onReasoning, opts.signal)
+    const streamed = await parseStreaming(
+      res.body,
+      opts.onToken,
+      opts.onReasoning,
+      signal,
+      stall.bump,
+    )
+    stall.stop()
+    return streamed
   } catch (err) {
     throw describeFailure(err, s)
+  } finally {
+    stall.stop()
   }
 }
 
@@ -313,6 +410,8 @@ async function parseStreaming(
   onToken: ((t: string) => void) | undefined,
   onReasoning: ((t: string) => void) | undefined,
   signal: AbortSignal,
+  /** Called on every chunk, to restart the stall watchdog. */
+  onProgress?: () => void,
 ): Promise<ChatResult> {
   const reader = stream.getReader()
   const decoder = new TextDecoder()
@@ -386,10 +485,33 @@ async function parseStreaming(
     }
   }
 
+  /*
+   * A read is raced against the abort, rather than relying on the abort
+   * propagating to the response body.
+   *
+   * Aborting the signal passed to `fetch` is *supposed* to error the body
+   * stream, and in practice it usually does — but `reader.read()` itself does not
+   * observe any signal, so a stall ends up depending on transport behaviour that
+   * is neither guaranteed nor uniform. Racing it here makes the watchdog work
+   * regardless: if the signal fires, the read stops, whoever is responsible for
+   * the underlying connection.
+   *
+   * Built once, outside the loop. A promise settles once, so there is nothing to
+   * rebuild, and building it per read would add an abort listener per chunk.
+   */
+  const aborted = new Promise<never>((_, reject) => {
+    const fail = () => reject(abortReason(signal))
+    if (signal.aborted) fail()
+    else signal.addEventListener('abort', fail, { once: true })
+  })
+
   try {
     for (;;) {
-      const { done, value } = await reader.read()
+      const { done, value } = await Promise.race([reader.read(), aborted])
       if (done) break
+      // Any bytes at all count as progress — including a keep-alive comment,
+      // which is exactly what a slow endpoint sends to say it is still there.
+      onProgress?.()
       buffer += decoder.decode(value, { stream: true })
 
       // SSE frames are separated by a blank line; \r\n\r\n appears in the wild.
@@ -409,8 +531,10 @@ async function parseStreaming(
     const tail = buffer.trim()
     if (tail.startsWith('data:')) consume(tail.slice(5).trim())
   } finally {
+    // Release the reader so the connection is not left held open after a stall.
+    // Errors here are of no interest: the request is already over.
+    void reader.cancel().catch(() => {})
     reader.releaseLock()
-    if (signal.aborted) throw new LlmError('Stopped.')
   }
 
   const toolCalls: ToolCall[] = [...partial.entries()]

@@ -99,6 +99,14 @@ current thing is still going. Queued prompts are listed above the input with a
 number and a way to remove each one, and they run in order as soon as the current
 task finishes. **Stop** clears the queue as well as the run.
 
+### When a request stalls
+
+If the endpoint accepts a request and then goes quiet — a model that crashed, an
+overloaded server, a dropped connection — WebPilot abandons it after 90 seconds
+of silence rather than waiting forever, and says so. The clock resets on every
+chunk received, so a slow model that is still talking is never cut short; only a
+silent one is.
+
 ### Chats are per tab
 
 Each tab has its own conversation. Switch tabs and you switch chats — a task

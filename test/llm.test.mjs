@@ -460,6 +460,100 @@ await test("reports a mid-stream error frame", async () => {
 })
 
 /* -------------------------------------------------------------------------- */
+/*  Stalls                                                                     */
+/* -------------------------------------------------------------------------- */
+
+section("stalls")
+
+await test("a request that never answers is abandoned", async () => {
+  /*
+   * The failure this guards: the agent's own request had no timeout at all, so a
+   * stalled endpoint left the run parked forever — status stuck on "working", a
+   * Stop button that aborted a controller nothing was watching, and the session
+   * saved as still running. Every restart then reported it as interrupted.
+   *
+   * The body is never written to and never closed, which is what a silently dead
+   * connection looks like.
+   */
+  const original = globalThis.fetch
+  globalThis.fetch = async () => {
+    const stream = new ReadableStream({ start() {} }) // never enqueues, never closes
+    return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } })
+  }
+
+  const started = Date.now()
+  const err = await chat(SETTINGS, {
+    messages: [{ role: "user", content: "hi" }],
+    signal: new AbortController().signal,
+    stallMs: 120,
+  })
+    .then(() => null)
+    .catch((e) => e)
+  globalThis.fetch = original
+
+  assert.ok(err instanceof LlmError, `expected an error, got ${err}`)
+  assert.match(err.message, /stopped responding/i, `unhelpful message: ${err.message}`)
+  assert.ok(Date.now() - started < 3000, "the stall was not detected promptly")
+})
+
+await test("a slow but live stream is not cut short", async () => {
+  /*
+   * The distinction that makes this a stall timeout rather than a deadline: the
+   * clock resets on every chunk. A model that takes ten seconds to answer but is
+   * clearly still talking must survive a timeout far shorter than the total.
+   */
+  const encoder = new TextEncoder()
+  const original = globalThis.fetch
+  globalThis.fetch = async () => {
+    const stream = new ReadableStream({
+      async start(controller) {
+        // Ten chunks, each well inside the stall window, but far longer in total.
+        for (let i = 0; i < 10; i++) {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: String(i) } }] })}\n\n`))
+          await new Promise((r) => setTimeout(r, 60))
+        }
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"))
+        controller.close()
+      },
+    })
+    return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } })
+  }
+
+  const result = await chat(SETTINGS, {
+    messages: [{ role: "user", content: "hi" }],
+    signal: new AbortController().signal,
+    stallMs: 200, // total elapsed is ~600ms, well past this
+  }).catch((e) => e)
+  globalThis.fetch = original
+
+  assert.ok(!(result instanceof Error), `a live stream was cut short: ${result?.message}`)
+  assert.equal(result.content, "0123456789")
+})
+
+await test("stopping is still reported as a stop, not a stall", async () => {
+  // The two share one signal, so the reason has to be what distinguishes them —
+  // telling someone their request stalled when they pressed Stop would be wrong.
+  const original = globalThis.fetch
+  globalThis.fetch = async () => {
+    const stream = new ReadableStream({ start() {} })
+    return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } })
+  }
+
+  const controller = new AbortController()
+  setTimeout(() => controller.abort(), 40)
+  const err = await chat(SETTINGS, {
+    messages: [{ role: "user", content: "hi" }],
+    signal: controller.signal,
+    stallMs: 60_000,
+  })
+    .then(() => null)
+    .catch((e) => e)
+  globalThis.fetch = original
+
+  assert.match(err?.message ?? "", /Stopped/i, `expected a stop, got: ${err?.message}`)
+})
+
+/* -------------------------------------------------------------------------- */
 /*  Rate limiting                                                              */
 /* -------------------------------------------------------------------------- */
 

@@ -515,6 +515,32 @@ await test("an interrupted run does not come back claiming to be running", async
   )
 })
 
+await test("the interruption notice does not stack up", async () => {
+  /*
+   * A stalled run is saved as still running, so every start reports it as
+   * interrupted — and each notice was persisted, so they accumulated and the
+   * transcript filled with the same line repeated. One notice is a fact; ten is
+   * a bug report.
+   */
+  const storage = {}
+
+  // Three save/restart cycles that each leave the session looking live.
+  for (let i = 0; i < 3; i++) {
+    const bg = loadBackground({ storage, hangingFetch: true })
+    const res = await bg.request({ type: "agent/state" })
+    const session = res.session ?? res.sessions?.find((x) => x.tabId === 1)
+    if (i > 0) {
+      const notices = session.steps.filter((st) => /interrupted/i.test(st.title))
+      assert.ok(notices.length <= 1, `${notices.length} interruption notices after ${i} restarts`)
+    }
+    // Force the stored state back to "working", as a stalled run would leave it.
+    if (storage["webpilot.sessions"]?.[0]) storage["webpilot.sessions"][0].status = "working"
+    else storage["webpilot.sessions"] = [{ tabId: 1, status: "working", messages: [], steps: [], turns: {}, queue: [] }]
+    await bg.flush()
+    if (storage["webpilot.sessions"]?.[0]) storage["webpilot.sessions"][0].status = "working"
+  }
+})
+
 await test("stop ends a live run", async () => {
   // The control the user reaches for when it looks stuck must always work.
   const fresh = loadBackground({ hangingFetch: true })
