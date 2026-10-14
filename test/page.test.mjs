@@ -225,6 +225,89 @@ await test("names a select by its label, not its options", async () => {
   assert.match(nodes[0].hint ?? "", /1 guest/)
 })
 
+await test("finds radio choices whose inputs are visually hidden", async () => {
+  /*
+   * The shape that defeated it: a quiz frame the agent could *read* but which
+   * reported no interactive elements at all, so there was no ref to click. The
+   * text was all there — each choice is a label — but the radios it drives are
+   * hidden, and `input` with a zero-size box was treated as invisible.
+   *
+   * A label is what a person sees and clicks in this pattern, so it is what the
+   * agent needs a reference to.
+   */
+  const f = makeFrame(`
+    <div class="question">
+      <p>Sorry I'm late. I ___ the train.</p>
+      <label><input type="radio" name="q3" value="missed" style="display:none"> missed</label>
+      <label><input type="radio" name="q3" value="lost" style="display:none"> lost</label>
+    </div>
+  `)
+  const { nodes } = await f.flatNodes()
+  const names = nodes.map((n) => n.name)
+
+  assert.ok(
+    names.includes("missed") || names.some((n) => /missed/.test(n)),
+    `the choices were not found; got: ${JSON.stringify(names)}`,
+  )
+
+  const missed = nodes.find((n) => /missed/.test(n.name))
+  assert.equal(missed.role, "radio", `expected a radio, got ${missed.role}`)
+})
+
+await test("clicking a label operates the control it drives", async () => {
+  const f = makeFrame(`<label><input type="radio" name="q" value="a" style="display:none"> choice a</label>`)
+  const box = f.document.body.querySelector("input")
+  const { nodes } = await f.flatNodes()
+  const label = nodes.find((n) => /choice a/.test(n.name))
+  assert.ok(label, "no label node was produced")
+
+  await f.exec({ op: "click", ref: label.id })
+  assert.equal(box.checked, true, "clicking the label did not select the radio")
+})
+
+await test("reports a choice as selected when its control is", async () => {
+  const f = makeFrame(`
+    <label><input type="radio" name="q" value="a" style="display:none"> option a</label>
+    <label><input type="radio" name="q" value="b" style="display:none" checked> option b</label>
+  `)
+  const { nodes } = await f.flatNodes()
+  const b = nodes.find((n) => /option b/.test(n.name))
+  assert.ok(b?.state?.includes("checked"), `state was ${JSON.stringify(b?.state)}`)
+  const a = nodes.find((n) => /option a/.test(n.name))
+  assert.ok(!a?.state?.includes("checked"), "an unselected choice reported as checked")
+})
+
+await test("finds a clickable div that only signals it with a cursor", async () => {
+  /*
+   * Design-system option tiles: a plain div with the appearance of a control and
+   * a handler attached somewhere above it. Nothing in the markup says it is
+   * interactive, so the only honest test is the one the browser uses to tell the
+   * user the same thing.
+   */
+  const f = makeFrame(`<div class="tile" style="cursor:pointer">Edinburgh</div>`)
+  const { nodes } = await f.flatNodes()
+  assert.ok(
+    nodes.some((n) => /Edinburgh/.test(n.name)),
+    `a pointer-cursor tile was not found; got ${JSON.stringify(nodes.map((n) => n.name))}`,
+  )
+})
+
+await test("does not treat a bare text container as a control", async () => {
+  // A paragraph is not interactive however much it looks like it might be.
+  const f = makeFrame(`<div><p>Just some prose on the page.</p></div>`)
+  const { nodes } = await f.flatNodes()
+  assert.equal(nodes.length, 0, `prose was reported as interactive: ${JSON.stringify(nodes.map((n) => n.name))}`)
+})
+
+await test("does not duplicate a visible control with its label", async () => {
+  // Both would carry the same name and role, leaving the agent no way to choose.
+  const f = makeFrame(`<label for="c">Country</label><select id="c"><option>Spain</option></select>`)
+  const { nodes } = await f.flatNodes()
+  assert.equal(nodes.length, 1, `got ${nodes.length} nodes: ${JSON.stringify(nodes.map((n) => n.name))}`)
+  assert.equal(nodes[0].name, "Country")
+  assert.equal(nodes[0].role, "combobox")
+})
+
 await test("drops a list wrapper so its items are not nested pointlessly", async () => {
   const f = makeFrame(`<ul><li><a href="/x">Item</a></li></ul>`)
   const { nodes } = await f.flatNodes()

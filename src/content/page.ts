@@ -54,6 +54,19 @@ const CANDIDATE_SELECTOR = [
   '[contenteditable=""]',
   '[onclick]',
   '[tabindex]:not([tabindex="-1"])',
+  /*
+   * A `<label>` is how a great many quizzes, surveys and preference screens put
+   * their choices on screen: a styled div next to a visually-hidden radio. The
+   * label is the only part with content, and clicking it is the only way to
+   * choose — so it is a first-class control, not decoration.
+   *
+   * An earlier version of this list excluded labels to avoid listing every field
+   * twice. That was wrong for non-text controls, where the input is either
+   * visually hidden or absent altogether, and it is what made a quiz frame look
+   * like it had no interactive elements at all.
+   */
+  'label[for]',
+  'label',
   'audio[controls]',
   'video[controls]',
   'form',
@@ -293,7 +306,25 @@ function roleOf(el: Element): string {
   // itself is the thing that holds the revealed content.
   if (tag === 'summary') return 'button'
   if (tag === 'details') return 'disclosure'
-  if (tag === 'label') return 'label'
+  /*
+   * A label takes its role from what it controls: the thing the user is actually
+   * choosing. A label wrapping a radio *is* a radio button as far as the
+   * interface is concerned — it is what gets clicked and what shows which choice
+   * is selected — and reporting it as a "label" tells the agent nothing about
+   * what it can do with it.
+   */
+  if (tag === 'label') {
+    const control = labelControl(el as HTMLLabelElement)
+    if (control) {
+      if (control instanceof HTMLInputElement) {
+        if (control.type === 'checkbox') return 'checkbox'
+        if (control.type === 'radio') return 'radio'
+      }
+      return roleOf(control)
+    }
+    // A label with nothing to control is decoration.
+    return 'generic'
+  }
   // Landmarks, so the outline shows how the page is organised rather than
   // presenting a flat list of controls with no idea where they live.
   if (tag === 'form') return 'form'
@@ -331,6 +362,31 @@ function roleOf(el: Element): string {
   return 'generic'
 }
 
+/**
+ * The control a `<label>` is for.
+ *
+ * Two ways a label attaches: the `for` attribute naming an id, or the control
+ * being nested inside it. Both are common and both mean the same thing to a
+ * person — clicking the label operates the control.
+ */
+function labelControl(label: HTMLLabelElement): HTMLElement | null {
+  const id = label.htmlFor || label.getAttribute('for')
+  if (id) {
+    const found = label.ownerDocument.getElementById(id)
+    if (found) return found
+  }
+  // The first labelable descendant; a label only ever controls one.
+  return label.querySelector(
+    'input, select, textarea, button, [role="button"], [role="radio"], [role="checkbox"]',
+  )
+}
+
+/** The control a node drives, when it drives another element. */
+function delegatingControl(el: Element): HTMLElement | null {
+  if (!(el instanceof HTMLLabelElement)) return null
+  return labelControl(el)
+}
+
 /** Current value, for the control types where a value is meaningful. */
 function valueOf(el: Element): string | undefined {
   if (el instanceof HTMLInputElement) {
@@ -354,6 +410,23 @@ function valueOf(el: Element): string | undefined {
 
 /** Flags that change what the agent should do next. */
 function stateOf(el: Element): string[] | undefined {
+  /*
+   * For a label driving a control, the state that matters is the control's.
+   * Reporting a label's own attributes would say nothing about whether the choice
+   * is currently selected — which is the single most useful thing to know about
+   * it.
+   */
+  const control = delegatingControl(el)
+  if (control) {
+    const inherited = stateOf(control) ?? []
+    // Selected-ness, in the vocabulary the model already reads.
+    if (control instanceof HTMLInputElement && (control.type === 'radio' || control.type === 'checkbox')) {
+      if (control.checked) return [...new Set([...inherited, 'checked'])]
+      return inherited.length ? inherited : undefined
+    }
+    return inherited.length ? inherited : undefined
+  }
+
   const out: string[] = []
   if (el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true') out.push('disabled')
   if (el instanceof HTMLInputElement) {
@@ -395,10 +468,82 @@ function optionsOf(el: Element): string[] | undefined {
  */
 function isInteractiveCandidate(el: Element): boolean {
   if (isOurs(el)) return false
-  if (!el.matches(CANDIDATE_SELECTOR)) return false
 
-  const role = roleOf(el)
-  if (role === 'presentation' || role === 'none') return false
+  /*
+   * A label is reported only when its control is not.
+   *
+   * When the control is visible it is the better thing to report — it carries the
+   * value, the options and the real state — and it already takes its name from the
+   * label, so reporting both would present two elements with the same name and
+   * role and no way for the agent to choose between them.
+   *
+   * The label earns its place in the opposite case: a quiz, survey or preference
+   * screen where the input is visually hidden and the label is the whole of what
+   * the user sees and clicks. Then the control is still reported (an off-screen
+   * input is easy to miss) but the label is what the agent can actually identify
+   * with — and clicking it operates the control.
+   */
+  if (el instanceof HTMLLabelElement) {
+    const control = labelControl(el)
+    if (control && isVisible(control)) return false
+    // Nothing to control, or nothing the user can see: decoration either way.
+    return Boolean(control)
+  }
+
+  if (el.matches(CANDIDATE_SELECTOR)) {
+    const role = roleOf(el)
+    if (role === 'presentation' || role === 'none') return false
+    return true
+  }
+
+  /*
+   * Last resort: an element that looks like something you can click, even though
+   * nothing in the markup says so.
+   *
+   * Plenty of real interfaces are built from plain elements with the *appearance*
+   * of a control and a click handler attached somewhere above them — a design
+   * system's `<div class="option">`, a card that looks tappable, an answer tile
+   * in a quiz. Keeping the candidate list to markup semantics is principled and
+   * leaves the agent unable to see them, which is worse.
+   *
+   * Two strong signals, both of which mean "a person would try clicking this":
+   * the pointer actually changes over it, or it declares itself visually
+   * clickable. CSS alone cannot be inspected directly, so the computed cursor is
+   * the honest test — it is exactly what the browser uses to tell the user the
+   * same thing.
+   *
+   * Kept deliberately narrow: `cursor: pointer` on a *large* element is usually a
+   * layout container with no handler of its own, and admitting those would fill
+   * the tree with boxes. Size is the discriminator, since a real control is
+   * small relative to the page.
+   */
+  if (el.closest('button, a, [role="button"], [role="link"]')) {
+    // Already inside a real control; its wrapper is not another one.
+    return false
+  }
+
+  const style = getComputedStyle(el)
+  const clickable =
+    style.cursor === 'pointer' ||
+    el.hasAttribute('data-clickable') ||
+    el.hasAttribute('data-action')
+
+  if (!clickable) return false
+
+  // A control, not a container: bounded in both directions. `vh` is deliberate
+  // because a container with `cursor: pointer` is typically full-height or
+  // full-width, while a control is a small tile.
+  const position = style.position
+  if (position === 'fixed' || position === 'absolute') {
+    // Absolutely positioned big overlays are containers or scrims.
+    const rect = el.getBoundingClientRect()
+    if (rect.width > window.innerWidth * 0.8 || rect.height > window.innerHeight * 0.8) return false
+  }
+
+  // Text content, so the agent has something to name it by.
+  const text = (el.textContent ?? '').trim()
+  if (!text && !el.getAttribute('aria-label') && !el.getAttribute('title')) return false
+
   return true
 }
 
@@ -839,15 +984,41 @@ function clickElement(el: Element): void {
   const target = el as HTMLElement
   scrollIntoViewIfNeeded(el)
 
+  /*
+   * A label driving a control gets both clicks.
+   *
+   * The browser's own label behaviour synthesises a click on the control, and the
+   * page may rely on it — but only when the label is genuinely associated, which
+   * is exactly what is uncertain here. Dispatching on both means the control ends
+   * up operated either way. It is idempotent in the ways that matter: a radio or
+   * checkbox converges on the same state, and a button's handler firing twice is
+   * prevented by the page's own re-entrancy in practice, where a fire-once guard
+   * is the normal pattern.
+   */
+  const delegated = delegatingControl(el)
+  if (delegated && delegated !== (el as unknown as HTMLElement)) {
+    dispatchClickSequence(delegated)
+  }
+
+  dispatchClickSequence(target)
+}
+
+/**
+ * Sends the full pointer sequence to one element.
+ *
+ * `el.click()` alone dispatches only a `click` event, so handlers bound to
+ * `mousedown` — which includes most drag, menu and canvas-driven UIs — never
+ * fire. Doing the sequence first and falling back covers both.
+ */
+function dispatchClickSequence(el: Element): void {
+  const target = el as HTMLElement
   const rect = el.getBoundingClientRect()
-  const x = rect.left + rect.width / 2
-  const y = rect.top + rect.height / 2
   const base = {
     bubbles: true,
     cancelable: true,
     composed: true,
-    clientX: x,
-    clientY: y,
+    clientX: rect.left + rect.width / 2,
+    clientY: rect.top + rect.height / 2,
     button: 0,
     buttons: 1,
     view: window,
@@ -857,8 +1028,7 @@ function clickElement(el: Element): void {
   const markHandled = () => {
     handled = true
   }
-
-  // Listen once for a real handler, so we only synthesise a click when needed.
+  // Listen once for a real handler, so a click is only synthesised when needed.
   el.addEventListener('click', markHandled, { once: true, capture: true })
 
   target.dispatchEvent(new PointerEvent('pointerdown', { ...base, pointerId: 1, isPrimary: true }))

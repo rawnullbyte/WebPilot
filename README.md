@@ -211,6 +211,14 @@ times in a row — rather than an arbitrary count.
 so it gets its own prefix: `f3:n4` is element 4 in frame 3. The agent treats all
 frames as one page, which is what lets it fill in an embedded checkout widget.
 
+**What counts as interactive** is deliberately broad. Markup semantics are the
+backbone, but plenty of real interfaces are built from plain elements with the
+appearance of a control — a design system's `<div class="option">`, or a quiz
+whose radios are visually hidden so the label is all you see. Both are found: a
+label stands in for the control it drives, and an element that changes the cursor
+to a pointer and actually contains something is treated as clickable. Clicking
+such a label operates its control, so the agent drives the real one underneath.
+
 **Refs are re-issued on every read.** They are not held stable across page
 mutations, because any attempt to track identity through arbitrary framework
 re-renders ends up pointing at recycled nodes — and a confidently wrong ref is
