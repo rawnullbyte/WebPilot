@@ -383,7 +383,10 @@ export class Agent {
      * nastier surprise than losing a queue you can retype.
      */
     const session = this.sessions.get(tabId)
-    if (session?.queue.length) session.queue = []
+    if (session?.queue.length) {
+      session.queue = []
+      this.emitQueue(session)
+    }
 
     /*
      * Force the status to a terminal one, unconditionally.
@@ -737,6 +740,7 @@ export class Agent {
    */
   private enqueue(session: Session, prompt: string): void {
     session.queue = [...session.queue, prompt]
+    this.emitQueue(session)
     this.addMessage(session, 'user', prompt)
     this.addStep(session, {
       index: 0,
@@ -752,21 +756,23 @@ export class Agent {
     const session = this.sessionFor(tabId)
     const at = session.queue.indexOf(prompt)
     if (at === -1) return false
+
     session.queue = session.queue.filter((_, i) => i !== at)
-    this.emit(tabId, {
-      kind: 'step',
-      step: {
-        id: `s${tabId}_unqueue_${Date.now()}`,
-        turn: 0,
-        index: 0,
-        at: Date.now(),
-        kind: 'note',
-        title: 'Removed from the queue',
-        detail: truncate(prompt, 120),
-        ok: false,
-      },
+    // The panel needs the new queue, not just a note that it changed.
+    this.emitQueue(session)
+    this.addStep(session, {
+      index: 0,
+      kind: 'note',
+      title: 'Removed from the queue',
+      detail: truncate(prompt, 120),
+      ok: false,
     })
     return true
+  }
+
+  /** Publishes the current queue to every interested panel. */
+  private emitQueue(session: Session): void {
+    this.emit(session.tabId, { kind: 'queue', queue: [...session.queue] })
   }
 
   /**
@@ -783,6 +789,7 @@ export class Agent {
     if (next === undefined) return
 
     session.queue = session.queue.slice(1)
+    this.emitQueue(session)
     this.draining.add(tabId)
 
     // `run` clears the flag itself once it unwinds.
@@ -1017,6 +1024,15 @@ export class Agent {
         }
       }
 
+      /*
+       * Clear the field before recording the answer. The panel derives its prompt
+       * from the session, so leaving this set until the next turn means the
+       * answered question sits above the composer while the transcript below
+       * already says it was answered — and its Send button posts to a prompt id
+       * that no longer exists, which now reports an error rather than failing
+       * silently.
+       */
+      session.question = null
       this.addMessage(session, 'user', answer)
       this.addStep(session, { ...step, kind: 'note', title: `You answered: ${answer}`, ok: true })
       return { content: `The user answered: ${answer}`, ok: true, kind: 'continue' }
@@ -1035,22 +1051,53 @@ export class Agent {
     const node: PageNode | null = snapshot ? findNode(snapshot, ref) : null
     const targetName = node?.name
 
-    // A ref from a page state we have already replaced is worth catching here,
-    // before it reaches the page and fails there with a vaguer message.
+    /*
+     * A ref that does not resolve is the single most common way the agent gets
+     * stuck, so the answer has to be specific rather than "try again".
+     *
+     * Three different causes look identical from here, and telling them apart is
+     * the whole point of this branch:
+     *
+     *  - The ref names a frame that is not in the reading at all. Usually an
+     *    iframe whose `src` is empty or which loads later than the read; the model
+     *    cannot reach into it because nothing was ever read from it. Retrying the
+     *    same ref will never work, and saying "call read_page" invites exactly
+     *    that.
+     *
+     *  - The ref names a frame we did read, but not that node. The element is
+     *    genuinely gone or was renumbered.
+     *
+     *  - There is no reading yet.
+     *
+     * Left to guess, a model responds to a bare "unknown element" by scrolling and
+     * pressing Tab — which is what this looked like in practice: a transcript of
+     * waits and key presses against refs that were never going to resolve.
+     */
     if (snapshot && !node) {
+      const frameId = frameIdOf(ref)
+      const knownFrame = snapshot.frames.some((f) => f.frameId === frameId)
+
+      const diagnosis = !knownFrame
+        ? `That reference points at frame ${frameId}, which is not part of the current reading. ` +
+          'It is probably an embedded frame (an iframe) that had no content when the page was read — ' +
+          'often because its source is still loading or empty. ' +
+          'Do not retry it. Call read_page to see which frames are readable now, and if it is still ' +
+          'missing, the content may not be reachable: tell the user what you cannot see rather than ' +
+          'working around it.'
+        : `Reference ${JSON.stringify(ref)} is not in the current reading of frame ${frameId}, ` +
+          'which suggests the page changed since it was read. Call read_page and act on a reference ' +
+          'from that.'
+
       this.addStep(session, {
         ...step,
         kind: 'error',
-        title: `Unknown element "${ref}"`,
+        title: !knownFrame ? `Frame ${frameId} is not readable` : `Unknown element "${ref}"`,
+        detail: !knownFrame
+          ? 'The reference targets a frame that was not part of the reading'
+          : undefined,
         ok: false,
       })
-      return {
-        content:
-          `There is no element "${ref}" on the current page. ` +
-          'Call read_page to get current references, then act on one of those.',
-        ok: false,
-        kind: 'continue',
-      }
+      return { content: diagnosis, ok: false, kind: 'continue' }
     }
 
     // Approval gate. In `auto` nothing is asked; in `risky` only actions that

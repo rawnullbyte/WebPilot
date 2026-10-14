@@ -84,3 +84,12 @@ for (const n of read.nodes) process.stdout.write(render(n, 0))
 
 console.log("\nscreenshot marks:", read.nodes.length ? "collected per element" : "none")
 console.log("truncated:", read.truncated)
+
+/*
+ * What the model is told about the parts of the page that could not be read.
+ *
+ * Worth showing here because it is the difference between an agent that hunts for
+ * a workaround in a frame it cannot see and one that says so — and because it is
+ * invisible in any assertion about the frame data itself.
+ */
+console.log("\nunreadable frames:", read.unreadable?.length ?? 0)

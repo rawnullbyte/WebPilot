@@ -124,6 +124,21 @@ export type Snapshot = {
   title: string
   viewport: ViewportInfo
   frames: FrameRead[]
+  /**
+   * Frames that exist but could not be read.
+   *
+   * Reported rather than omitted. A frame that yields nothing is otherwise
+   * indistinguishable from a frame that is not there, and the difference decides
+   * what the agent should do: an element missing from a frame it *did* read means
+   * the page changed, whereas an element missing from one it could not read at
+   * all means it is blind to that part of the page and should say so instead of
+   * hunting for a workaround.
+   *
+   * This is what a page with a lazily-populated `<iframe src="">` looks like from
+   * the agent's side, and it is the case that produced a transcript of retries,
+   * scrolls and Tab presses against references that were never going to resolve.
+   */
+  unreadable: { frameId: number, url: string }[]
   /** Element outlines drawn onto the screenshot, in page coordinates. */
   marks: (Rect & { ref: string })[]
   truncated: boolean
@@ -190,6 +205,20 @@ export type AgentEvent =
    * completes.
    */
   | { kind: 'stream', stream: { id: string, text: string, done: boolean } }
+  /**
+   * The whole queue, after it changed.
+   *
+   * Sent as the full list rather than a diff. The queue is short, and a diff
+   * would need the panel to apply insertions and removals in order — where a
+   * dropped or reordered event leaves it with a queue that never matches the
+   * agent's. Replacing it wholesale cannot drift.
+   *
+   * Without this the panel only ever learned the queue from a *state snapshot*,
+   * which is sent on registration and on request. So removing a queued prompt
+   * changed the agent's state while the panel went on displaying the old list —
+   * the remove button looked like it did nothing.
+   */
+  | { kind: 'queue', queue: string[] }
 
 export type AgentSessionState = {
   status: AgentStatus
@@ -272,8 +301,18 @@ export type UiSurface = 'sidebar' | 'overlay' | 'popup'
 export type BgRequest =
   | { type: 'agent/run', prompt: string }
   | { type: 'agent/stop' }
-  | { type: 'agent/answer', id: string, answer: string }
-  | { type: 'agent/approve', id: string, approved: boolean }
+  /*
+   * `promptId`, not `id`.
+   *
+   * The panel sends replies over a long-lived port, and every request through it
+   * carries an `id` used to match the reply to the caller. Spreading that
+   * correlation id over a request that has its own `id` silently overwrote it —
+   * so the background looked up a prompt that did not exist, found nothing, and
+   * replied `{ok: true}` regardless. Answering a question did nothing at all, and
+   * every approval expired into a decline five minutes later.
+   */
+  | { type: 'agent/answer', promptId: string, answer: string }
+  | { type: 'agent/approve', promptId: string, approved: boolean }
   | { type: 'agent/clear' }
   /** Removes a queued prompt that has not started yet. */
   | { type: 'agent/unqueue', prompt: string }
@@ -325,9 +364,9 @@ export type BgEvent =
    */
   | { type: 'agent/state', tabId: number | null, session: AgentSessionState }
   /** The agent paused and is blocked on a yes/no about one action. */
-  | { type: 'agent/approval', id: string, action: string, reason: string }
+  | { type: 'agent/approval', promptId: string, action: string, reason: string }
   /** The agent needs free-text input from the user. */
-  | { type: 'agent/question', id: string, text: string }
+  | { type: 'agent/question', promptId: string, text: string }
   | { type: 'ui/close' }
 
 /** Background → panel, answering a request made over the same port. */

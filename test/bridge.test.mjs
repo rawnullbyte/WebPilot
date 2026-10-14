@@ -403,6 +403,52 @@ await test("notes when the page was too large to read fully", async () => {
   assert.match(text, /too large to read in full/, "truncation must be disclosed, not hidden")
 })
 
+await test("reports a frame that exists but could not be read", async () => {
+  /*
+   * A frame that yields nothing is otherwise indistinguishable from a frame that
+   * is not there — and the difference decides what the agent should do. An
+   * element missing from a frame it *did* read means the page changed; an element
+   * missing from one it could not read means it is blind to that part of the page
+   * and should say so rather than hunting for a workaround.
+   *
+   * This is the shape of a real page that defeated it: an `<iframe src="">` the
+   * site populates later, which produced a transcript of retries, scrolls and Tab
+   * presses against references that were never going to resolve.
+   */
+  const browser = stubBrowser({
+    frames: [
+      ...topOnly,
+      { frameId: 9, parentFrameId: 0, url: "https://widgets.example.test/quiz" },
+    ],
+    // The iframe has no content script: messaging it rejects.
+    replies: (frameId) => (frameId === 9 ? undefined : frameReply()),
+    tab,
+  })
+  const bridge = await loadBridge(browser)
+
+  const snapshot = await bridge.readPage(1)
+  assert.equal(snapshot.unreadable.length, 1, "the unreadable frame was not recorded")
+  assert.equal(snapshot.unreadable[0].frameId, 9)
+
+  const text = bridge.renderSnapshot(snapshot)
+  assert.match(text, /could not be read/i, "the prompt never mentions the unreadable frame")
+  assert.match(text, /f9/, "the unreadable frame is not identified by its reference prefix")
+  assert.match(text, /NOT available to you/i, "the model is not warned that the content is missing")
+})
+
+await test("does not report an empty tracker frame as unreadable", async () => {
+  // Analytics frames are meant to be empty, and listing them would train the
+  // model to ignore the section that matters.
+  const browser = stubBrowser({
+    frames: [...topOnly, { frameId: 4, parentFrameId: 0, url: "https://www.googletagmanager.com/ns.html" }],
+    replies: (frameId) => (frameId === 4 ? undefined : frameReply()),
+    tab,
+  })
+  const bridge = await loadBridge(browser)
+  const snapshot = await bridge.readPage(1)
+  assert.equal(snapshot.unreadable.length, 0, `a tracker frame was reported: ${JSON.stringify(snapshot.unreadable)}`)
+})
+
 await test("marks an off-screen element", async () => {
   const browser = stubBrowser({
     frames: topOnly,

@@ -110,6 +110,18 @@ async function askFrame<T>(tabId: number, frameId: number, message: unknown): Pr
   }
 }
 
+/** Whether a reply actually carries a usable frame reading. */
+function isFrameRead(value: unknown): value is FrameRead {
+  if (!value || typeof value !== 'object') return false
+  const frame = value as Partial<FrameRead>
+  return (
+    typeof frame.url === 'string' &&
+    Array.isArray(frame.nodes) &&
+    typeof frame.text === 'string' &&
+    typeof frame.truncated === 'boolean'
+  )
+}
+
 async function ensureContentScript(tabId: number, frameId: number): Promise<boolean> {
   try {
     await ext.scripting.executeScript({
@@ -136,11 +148,23 @@ export async function readPage(tabId: number): Promise<Snapshot> {
 
   const results = await Promise.all(
     frames.slice(0, READ_BUDGET.maxFrames).map(async (info) => {
+      /*
+       * `read.value.frame` is validated, not assumed.
+       *
+       * A reply without a frame means the content script is an older build — the
+       * usual cause is reloading the extension, which leaves the scripts already
+       * injected into open tabs running the previous version until those tabs
+       * navigate. Reading `.frame` off it yields `undefined`, which then flows
+       * into the frame list and throws on the first property access, losing the
+       * *entire* page read rather than just that frame. Treating a malformed
+       * reply as "could not read this frame" keeps everything else working, and
+       * the frame is reported to the model as unreadable rather than vanishing.
+       */
       const read = await askFrame<{ frame: FrameRead }>(tabId, info.frameId, {
         type: 'frame/read',
         budget: READ_BUDGET,
       })
-      if (read.ok) return { info, frame: read.value.frame }
+      if (read.ok && isFrameRead(read.value.frame)) return { info, frame: read.value.frame }
 
       const injected = await ensureContentScript(tabId, info.frameId)
       if (!injected) return { info, frame: null }
@@ -149,7 +173,7 @@ export async function readPage(tabId: number): Promise<Snapshot> {
         type: 'frame/read',
         budget: READ_BUDGET,
       })
-      return { info, frame: retry.ok ? retry.value.frame : null }
+      return { info, frame: retry.ok && isFrameRead(retry.value.frame) ? retry.value.frame : null }
     }),
   )
 
@@ -179,6 +203,18 @@ export async function readPage(tabId: number): Promise<Snapshot> {
     if (b.info.frameId === 0) return 1
     return a.info.parentFrameId - b.info.parentFrameId
   })
+
+  /*
+   * Frames that exist but produced nothing readable.
+   *
+   * Filtered to exclude the ones that are *meant* to be empty — analytics and ad
+   * slots — because listing those would train the model to ignore this section.
+   * What remains is a real part of the page the agent cannot see into.
+   */
+  const unreadable = results
+    .filter((r) => r.frame === null || r.frame.hidden)
+    .map((r) => ({ frameId: r.info.frameId, url: r.info.url }))
+    .filter((f) => f.frameId !== 0 && f.url && !isAdOrTracker(f.url))
 
   let textBudget = READ_BUDGET.totalText
   let nodeBudget = READ_BUDGET.totalNodes
@@ -230,6 +266,7 @@ export async function readPage(tabId: number): Promise<Snapshot> {
     title: tab?.title ?? top?.title ?? '',
     viewport: top?.viewport ?? fallbackViewport(),
     frames: keptFrames,
+    unreadable,
     marks,
     truncated,
   }
@@ -339,7 +376,29 @@ export async function execOp(tabId: number, op: AgentOp): Promise<ExecOutcome> {
     }
   }
 
-  const result = reply.value.result
+  /*
+   * Validate the reply rather than trusting it.
+   *
+   * The content script always sends `result`, but a frame running an *older*
+   * copy can send anything: reloading the extension leaves the existing tabs'
+   * content scripts in place until they navigate, so a background can find
+   * itself talking to a script from the previous version. Assuming the shape and
+   * reading `result.ok` off `undefined` throws a TypeError, which surfaces to the
+   * user as "Cannot read properties of undefined" and ends the run with no
+   * explanation of what actually went wrong.
+   */
+  const result = reply.value?.result
+  if (!result || typeof result.ok !== 'boolean') {
+    return {
+      ok: false,
+      message:
+        'That page is running an older copy of WebPilot, so the action could not be carried out. ' +
+        'Reload the page to pick up the current version.',
+      error: 'stale content script',
+      stale: false,
+    }
+  }
+
   return {
     ok: result.ok,
     message: result.message,
@@ -430,6 +489,25 @@ export function renderSnapshot(snapshot: Snapshot): string {
       lines.push('')
       lines.push('(this page exposes no interactive elements)')
     }
+  }
+
+  if (snapshot.unreadable.length) {
+    lines.push('')
+    lines.push(
+      `--- frames that could not be read (${snapshot.unreadable.length}) ---`,
+    )
+    for (const frame of snapshot.unreadable) {
+      lines.push(
+        `- frame f${frame.frameId}: ${truncateUrl(frame.url)} — nothing could be read from it. ` +
+          'Its contents are NOT available to you.',
+      )
+    }
+    lines.push(
+      'These are real parts of the page that you cannot see into — typically an embedded ' +
+        'widget that had not loaded when the page was read. Do not invent actions against them. ' +
+        'If the task needs them, call read_page again in case they have loaded since; if they ' +
+        'are still empty, tell the user that part of the page is not reachable.',
+    )
   }
 
   if (snapshot.truncated) {

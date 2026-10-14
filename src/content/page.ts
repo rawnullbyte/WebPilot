@@ -1245,11 +1245,15 @@ async function performOp(op: AgentOp, budget: ReadBudget): Promise<OpResult> {
       return {
         ok: true,
         message: 'Read the page.',
+        // A single frame answering for itself cannot know what its siblings are,
+        // so it reports none as unreadable; the bridge fills that in when it
+        // assembles the whole page.
         snapshot: {
           url: frame.url,
           title: frame.title,
           viewport: frame.viewport,
           frames: [frame],
+          unreadable: [],
           marks: [],
           truncated: frame.truncated,
         },

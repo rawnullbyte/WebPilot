@@ -239,6 +239,9 @@ export function applyEvent(
           status: 'idle',
         }
       }
+      if (e.kind === 'queue') {
+        return { ...state, queue: e.queue }
+      }
       if (e.kind === 'stream') {
         /*
          * Accumulate, or clear when the producer says it is done. The `done` flag
@@ -274,12 +277,12 @@ export function applyEvent(
       return state
     }
     case 'agent/question':
-      return { ...state, question: { id: event.id, text: event.text }, status: 'waiting' }
+      return { ...state, question: { id: event.promptId, text: event.text }, status: 'waiting' }
     case 'agent/approval':
       return {
         ...state,
         status: 'waiting',
-        approval: { id: event.id, action: event.action, reason: event.reason },
+        approval: { id: event.promptId, action: event.action, reason: event.reason },
       }
     default:
       return state

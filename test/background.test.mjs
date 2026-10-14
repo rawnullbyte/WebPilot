@@ -284,6 +284,83 @@ await test("agent/run refuses when nothing is configured", async () => {
   assert.match(res.error, /Settings/i, "the refusal should say where to fix it")
 })
 
+await test("a ref to a frame that was never read says so", async () => {
+  /*
+   * The three causes of an unresolved ref look identical from the agent, and
+   * telling them apart is the point. A ref naming a frame that is not in the
+   * reading at all — a lazily-loaded iframe — will never resolve, so answering
+   * "call read_page and try again" invites exactly the retry loop that this
+   * produced in practice.
+   */
+  const fresh = loadBackground()
+  const panel = fresh.connectPanel("sidebar", 1)
+  await fresh.request({ type: "settings/set", patch: { endpoint: "https://x.test/v1", model: "m" } })
+
+  // A readable page with no frame 999 on it, which is the situation under test.
+  const emptyFrame = {
+    frameId: 0,
+    url: "https://example.test/",
+    title: "Example",
+    hidden: false,
+    viewport: { scrollX: 0, scrollY: 0, innerWidth: 1280, innerHeight: 800, scrollWidth: 1280, scrollHeight: 800, dpr: 1 },
+    text: "A page",
+    nodes: [{ id: "n0", role: "button", name: "Go", inView: true }],
+    truncated: false,
+  }
+  fresh.sandbox.chrome.tabs.sendMessage = async (_tabId, msg) =>
+    msg?.type === "frame/read" ? { ok: true, frame: emptyFrame } : { ok: true }
+
+  let turn = 0
+  const encoder = new TextEncoder()
+  const frame = (o) => `data: ${JSON.stringify(o)}\n\n`
+  fresh.sandbox.fetch = async () => {
+    turn++
+    const body =
+      turn === 1
+        ? [
+            frame({
+              choices: [
+                {
+                  delta: {
+                    tool_calls: [
+                      {
+                        index: 0,
+                        id: "c1",
+                        function: { name: "click", arguments: JSON.stringify({ ref: "f999:n0" }) },
+                      },
+                    ],
+                  },
+                },
+              ],
+            }),
+            "data: [DONE]\n\n",
+          ]
+        : [frame({ choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] }), "data: [DONE]\n\n"]
+    return new Response(
+      new ReadableStream({
+        start(c) {
+          for (const chunk of body) c.enqueue(encoder.encode(chunk))
+          c.close()
+        },
+      }),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    )
+  }
+
+  await fresh.request({ type: "agent/run", prompt: "click it" })
+  await new Promise((r) => setTimeout(r, 200))
+
+  const res = await fresh.request({ type: "agent/state" })
+  const step = res.session.steps.find((st) => /frame 999/i.test(st.title ?? ""))
+  assert.ok(step, `no frame-specific diagnosis; steps: ${res.session.steps.map((st) => st.title).join(" | ")}`)
+  assert.match(
+    step.detail ?? "",
+    /not part of the reading|not readable/i,
+    "the step does not explain that the frame was never read",
+  )
+  void panel
+})
+
 await test("agent/state reports an idle session", async () => {
   const res = await bg.request({ type: "agent/state" })
   assert.equal(res.session.status, "idle")
@@ -603,6 +680,129 @@ await test("a corrupt store does not stop the extension starting", async () => {
   assert.ok(res.settings, "the extension did not start properly")
 })
 
+section("prompts")
+
+/*
+ * Answering a question and approving an action were both broken by an id
+ * collision, and neither had a test — which is why it survived.
+ *
+ * The panel sends its replies over a long-lived port, and every request through
+ * that port carries an `id` used to match the reply to the caller. Spreading that
+ * correlation id over a request that had its own `id` overwrote it, so the
+ * background looked up a prompt that did not exist, found nothing, and returned
+ * `{ok: true}` regardless. Answering did nothing at all; every approval expired
+ * into a decline five minutes later.
+ */
+
+/** A background whose model asks a question on its first turn, then finishes. */
+function loadAskingBackground() {
+  const bg = loadBackground({ hangingFetch: true })
+  let turn = 0
+  // `sandbox.fetch`, not `chrome.fetch`: the bundle resolves `fetch` as a global
+  // in the vm realm, so a property on the extension API object is never read.
+  bg.sandbox.fetch = async () => {
+    turn++
+    const encoder = new TextEncoder()
+    const frame = (o) => `data: ${JSON.stringify(o)}\n\n`
+    const body =
+      turn === 1
+        ? [
+            frame({
+              choices: [
+                {
+                  delta: {
+                    tool_calls: [
+                      {
+                        index: 0,
+                        id: "c1",
+                        function: {
+                          name: "ask_user",
+                          arguments: JSON.stringify({ question: "Which account?" }),
+                        },
+                      },
+                    ],
+                  },
+                },
+              ],
+            }),
+            "data: [DONE]\n\n",
+          ]
+        : [
+            frame({ choices: [{ delta: { content: "Done." }, finish_reason: "stop" }] }),
+            "data: [DONE]\n\n",
+          ]
+    return new Response(
+      new ReadableStream({
+        start(c) {
+          for (const chunk of body) c.enqueue(encoder.encode(chunk))
+          c.close()
+        },
+      }),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    )
+  }
+  return { bg, turns: () => turn }
+}
+
+await test("a question reaches the panel with an id the panel can reply to", async () => {
+  const { bg } = loadAskingBackground()
+  const panel = bg.connectPanel("sidebar", 1)
+  await bg.request({ type: "settings/set", patch: { endpoint: "https://x.test/v1", model: "m" } })
+  await bg.request({ type: "agent/run", prompt: "ask me" })
+  await new Promise((r) => setTimeout(r, 120))
+
+  const question = panel.received.find((m) => m.type === "agent/question")
+  assert.ok(question, `no question was pushed; got: ${panel.received.map((m) => m.type).join(", ")}`)
+  // `promptId`, not `id`: the correlation id the port adds would clobber it.
+  assert.ok(question.promptId, "the question carried no promptId")
+  assert.equal(question.promptId, question.id || question.promptId)
+})
+
+await test("answering resumes the run", async () => {
+  const { bg, turns } = loadAskingBackground()
+  const panel = bg.connectPanel("sidebar", 1)
+  await bg.request({ type: "settings/set", patch: { endpoint: "https://x.test/v1", model: "m" } })
+  await bg.request({ type: "agent/run", prompt: "ask me" })
+  await new Promise((r) => setTimeout(r, 120))
+
+  const question = panel.received.find((m) => m.type === "agent/question")
+  const before = turns()
+
+  const reply = await bg.request({
+    type: "agent/answer",
+    promptId: question.promptId,
+    answer: "the second one",
+  })
+  assert.equal(reply.ok, true, `the answer was rejected: ${JSON.stringify(reply)}`)
+
+  await new Promise((r) => setTimeout(r, 200))
+  assert.ok(turns() > before, "the model was never asked again — the run stayed parked")
+
+  const res = await bg.request({ type: "agent/state" })
+  assert.equal(res.session.question, null, "the question is still pending after being answered")
+  assert.ok(
+    res.session.messages.some((m) => m.text.includes("the second one")),
+    "the answer never reached the transcript",
+  )
+})
+
+await test("answering a prompt that is not waiting reports a failure", async () => {
+  /*
+   * Returning success for a prompt that was not found is exactly how the id
+   * collision stayed invisible: the caller was told its answer had been accepted
+   * while the agent sat waiting for the full timeout.
+   */
+  const fresh = loadBackground()
+  const res = await fresh.request({ type: "agent/answer", promptId: "nope", answer: "x" })
+  assert.equal(res.ok, false, "a bogus prompt id was accepted as answered")
+})
+
+await test("approving a prompt that is not waiting reports a failure", async () => {
+  const fresh = loadBackground()
+  const res = await fresh.request({ type: "agent/approve", promptId: "nope", approved: true })
+  assert.equal(res.ok, false)
+})
+
 section("queueing")
 
 await test("a long task runs without a step limit", async () => {
@@ -660,6 +860,43 @@ await test("a queued prompt appears in the transcript straight away", async () =
     res.session.messages.some((m) => m.text === "queued one"),
     "the queued prompt was not recorded",
   )
+})
+
+await test("removing a queued prompt updates the panel", async () => {
+  /*
+   * The queue only ever reached the panel in a full state snapshot, which is sent
+   * on registration and on request. So removing a prompt changed the agent's state
+   * while the panel went on displaying the old list — the remove button appeared
+   * to do nothing at all.
+   */
+  const fresh = loadBackground({ hangingFetch: true })
+  const panel = fresh.connectPanel("sidebar", 1)
+  await fresh.request({ type: "settings/set", patch: { endpoint: "https://x.test/v1", model: "m" } })
+
+  await fresh.request({ type: "agent/run", prompt: "first" })
+  await fresh.request({ type: "agent/run", prompt: "take it back" })
+  await new Promise((r) => setTimeout(r, 40))
+
+  // The queue must have been pushed as its own event, not only in the snapshot.
+  const pushed = panel.received.filter((m) => m.type === "agent/event" && m.event?.kind === "queue")
+  assert.ok(pushed.length > 0, "the queue was never pushed to the panel")
+
+  const beforeRemoval = pushed.length
+  const removed = await fresh.request({ type: "agent/unqueue", prompt: "take it back" })
+  assert.equal(removed.ok, true, `could not remove: ${JSON.stringify(removed)}`)
+
+  const after = panel.received.filter((m) => m.type === "agent/event" && m.event?.kind === "queue")
+  assert.ok(after.length > beforeRemoval, "removal did not push the new queue")
+  const latest = after[after.length - 1].event.queue
+  assert.ok(!latest.includes("take it back"), `the panel still shows it: ${JSON.stringify(latest)}`)
+})
+
+await test("removing a prompt that already started explains why", async () => {
+  const fresh = loadBackground({ hangingFetch: true })
+  fresh.connectPanel("sidebar", 1)
+  const res = await fresh.request({ type: "agent/unqueue", prompt: "never queued" })
+  assert.equal(res.ok, false)
+  assert.ok(res.error, "no explanation was given")
 })
 
 await test("a queued prompt can be removed", async () => {

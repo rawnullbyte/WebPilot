@@ -94,11 +94,11 @@ async function awaitApproval(
    */
   agent.sessionFor(tabId).approval = { id, action, reason }
 
-  if (emit(tabId, { type: 'agent/approval', id, action, reason }) === 0) {
+  if (emit(tabId, { type: 'agent/approval', promptId: id, action, reason }) === 0) {
     // Nobody is watching. Make a panel appear rather than block for five minutes
     // on a prompt no human will ever see.
     await ensureOverlay(tabId)
-    emit(tabId, { type: 'agent/approval', id, action, reason })
+    emit(tabId, { type: 'agent/approval', promptId: id, action, reason })
   }
 
   return new Promise<boolean>((resolve) => {
@@ -124,9 +124,9 @@ async function awaitApproval(
 async function awaitQuestion(tabId: number, id: string, text: string): Promise<string> {
   agent.sessionFor(tabId).question = { id, text }
 
-  if (emit(tabId, { type: 'agent/question', id, text }) === 0) {
+  if (emit(tabId, { type: 'agent/question', promptId: id, text }) === 0) {
     await ensureOverlay(tabId)
-    emit(tabId, { type: 'agent/question', id, text })
+    emit(tabId, { type: 'agent/question', promptId: id, text })
   }
 
   return new Promise<string>((resolve) => {
@@ -288,16 +288,23 @@ async function handleRequest(req: BgRequest, tabId: number | null): Promise<unkn
       return { ok: true }
 
     case 'agent/approve': {
-      const entry = pendingApprovals.get(req.id)
+      const entry = pendingApprovals.get(req.promptId)
       // Resolving clears its own timer and the session record.
       if (entry) entry.resolve(req.approved)
-      return { ok: true }
+      /*
+       * Report whether it actually resolved. Returning `{ok: true}` for a prompt
+       * that was not found is how the id collision above stayed invisible: the
+       * caller was told its answer had been accepted while the agent sat waiting
+       * for the full timeout. A missing prompt is a real outcome and the caller
+       * deserves to know.
+       */
+      return entry ? { ok: true } : { ok: false, error: 'That prompt is no longer waiting.' }
     }
 
     case 'agent/answer': {
-      const entry = pendingQuestions.get(req.id)
+      const entry = pendingQuestions.get(req.promptId)
       if (entry) entry.resolve(req.answer)
-      return { ok: true }
+      return entry ? { ok: true } : { ok: false, error: 'That question is no longer waiting.' }
     }
 
     case 'agent/clear':
@@ -305,7 +312,9 @@ async function handleRequest(req: BgRequest, tabId: number | null): Promise<unkn
       return { ok: true }
 
     case 'agent/unqueue':
-      return { ok: agent.unqueue(requireTab(), req.prompt) }
+      return agent.unqueue(requireTab(), req.prompt)
+        ? { ok: true }
+        : { ok: false, error: 'That prompt has already started, or was already removed.' }
 
     case 'agent/state':
       // The session for the requesting tab, or every session when the caller is
@@ -477,14 +486,14 @@ ext.runtime.onConnect.addListener((port) => {
           if (session.question) {
             port.postMessage({
               type: 'agent/question',
-              id: session.question.id,
+              promptId: session.question.id,
               text: session.question.text,
             } satisfies BgEvent)
           }
           if (session.approval) {
             port.postMessage({
               type: 'agent/approval',
-              id: session.approval.id,
+              promptId: session.approval.id,
               action: session.approval.action,
               reason: session.approval.reason,
             } satisfies BgEvent)

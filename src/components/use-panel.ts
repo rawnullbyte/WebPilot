@@ -169,7 +169,14 @@ export function usePanel(surface: UiSurface, tabId?: number | null): PanelApi {
 
   const unqueue = React.useCallback(
     (prompt: string) => {
-      void client.request({ type: 'agent/unqueue', prompt }).catch(() => {})
+      void client
+        .request<{ ok: boolean, error?: string }>({ type: 'agent/unqueue', prompt })
+        .then((res) => {
+          // A prompt that has already started cannot be removed, and saying so is
+          // better than a button that appears to do nothing.
+          if (res && res.ok === false) setError(res.error ?? 'That prompt could not be removed.')
+        })
+        .catch((err) => setError(err instanceof Error ? err.message : String(err)))
     },
     [client],
   )
@@ -180,14 +187,18 @@ export function usePanel(surface: UiSurface, tabId?: number | null): PanelApi {
 
   const answer = React.useCallback(
     (id: string, text: string) => {
-      void client.request({ type: 'agent/answer', id, answer: text }).catch(() => {})
+      void client
+        .request({ type: 'agent/answer', promptId: id, answer: text })
+        .catch(() => {})
     },
     [client],
   )
 
   const approve = React.useCallback(
     (id: string, approved: boolean) => {
-      void client.request({ type: 'agent/approve', id, approved }).catch(() => {})
+      void client
+        .request({ type: 'agent/approve', promptId: id, approved })
+        .catch(() => {})
     },
     [client],
   )
