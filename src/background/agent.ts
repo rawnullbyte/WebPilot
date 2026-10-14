@@ -30,16 +30,10 @@
 import { ext, loadSettings, type Settings } from '@/shared/settings'
 import type { AgentEvent, AgentStatus, ChatMessage, PageNode, Snapshot, Step } from '@/shared/types'
 import { chat, LlmError, RateLimiter, type ContentPart, type ToolCall, type WireMessage } from './llm'
-import {
-  captureAnnotated,
-  clearHighlight,
-  execOp,
-  readPage,
-  renderSnapshot,
-  setHighlight,
-} from './page-bridge'
+import { captureAnnotated, execOp, readPage, renderSnapshot } from './page-bridge'
 import { assessRisk, describeAction, isCrossSite, MUTATING_TOOLS, toolsFor } from './tools'
 import { clampResult, runScript, type ScriptWorld } from './evaluate'
+import { loadSessions, saveSessions, type StoredSession } from './sessions-store'
 
 /* -------------------------------------------------------------------------- */
 /*  Session state                                                              */
@@ -57,6 +51,14 @@ export type Session = {
   stream: { thinking: string, answer: string }
   /** Completed reasoning and prose, keyed by turn. */
   turns: Record<number, { thinking: string, answer: string }>
+  /**
+   * Messages waiting to be run, in order.
+   *
+   * Held on the session so a queue survives both a background restart and a
+   * navigation — the two things most likely to be happening while a long task
+   * runs and someone is typing their next request.
+   */
+  queue: string[]
   note?: string
 }
 
@@ -88,6 +90,87 @@ export class Agent {
   readonly rateLimiter = new RateLimiter(120)
 
   /* ---------------------------------------------------------------------- */
+  /*  Persistence                                                            */
+  /* ---------------------------------------------------------------------- */
+
+  private restoring: Promise<void> | null = null
+  private saveTimer: ReturnType<typeof setTimeout> | null = null
+  private saveInFlight: Promise<void> = Promise.resolve()
+
+  /**
+   * Restores stored sessions, once per background lifetime.
+   *
+   * Every entry point awaits this before touching a session, so a caller can
+   * never observe a half-restored state — which would look identical to the bug
+   * this exists to fix.
+   */
+  ready(): Promise<void> {
+    if (!this.restoring) {
+      this.restoring = (async () => {
+        for (const stored of await loadSessions()) {
+          // A stored session holds only what is worth restoring; the live-only
+          // fields start clean, because nothing is streaming and no prompt is
+          // pending after a restart.
+          this.sessions.set(stored.tabId, {
+            tabId: stored.tabId,
+            status: stored.status,
+            messages: stored.messages,
+            steps: stored.steps,
+            turns: stored.turns,
+            queue: stored.queue,
+            question: null,
+            approval: null,
+            stream: { thinking: '', answer: '' },
+            note: stored.note,
+          })
+        }
+      })()
+    }
+    return this.restoring
+  }
+
+  /** The serialisable view of every session. */
+  private snapshot(): StoredSession[] {
+    return [...this.sessions.values()].map((session) => ({
+      tabId: session.tabId,
+      status: session.status,
+      messages: session.messages,
+      steps: session.steps,
+      turns: session.turns,
+      queue: session.queue,
+      note: session.note,
+    }))
+  }
+
+  /**
+   * Queues a save, coalescing bursts.
+   *
+   * Streaming produces an event per token; writing on each would be hundreds of
+   * storage round trips per turn. A short debounce collapses them into one, and
+   * the trailing write is what guarantees the *final* state lands — the one that
+   * matters for a restart.
+   */
+  private persist(): void {
+    if (this.saveTimer) return
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = null
+      // Serialised through a single chain so two writes cannot interleave and
+      // leave the older one last.
+      this.saveInFlight = this.saveInFlight.then(() => saveSessions(this.snapshot()))
+    }, 400)
+  }
+
+  /** Writes immediately. Used when the background is about to be unloaded. */
+  async flush(): Promise<void> {
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer)
+      this.saveTimer = null
+    }
+    this.saveInFlight = this.saveInFlight.then(() => saveSessions(this.snapshot()))
+    await this.saveInFlight
+  }
+
+  /* ---------------------------------------------------------------------- */
   /*  Sessions                                                               */
   /* ---------------------------------------------------------------------- */
 
@@ -109,6 +192,7 @@ export class Agent {
         approval: null,
         stream: { thinking: '', answer: '' },
         turns: {},
+        queue: [],
       }
       this.sessions.set(tabId, session)
     }
@@ -122,6 +206,11 @@ export class Agent {
   isRunning(tabId: number): boolean {
     const status = this.sessions.get(tabId)?.status
     return status === 'working' || status === 'waiting'
+  }
+
+  /** How many prompts are waiting in a tab. */
+  queuedCount(tabId: number): number {
+    return this.sessions.get(tabId)?.queue.length ?? 0
   }
 
   /**
@@ -165,6 +254,9 @@ export class Agent {
       session.status = event.status
       session.note = event.note
     }
+
+    // Every mutation is written out, so a background restart cannot lose it.
+    this.persist()
 
     for (const fn of this.listeners) {
       try {
@@ -233,17 +325,38 @@ export class Agent {
    */
   stop(tabId: number): void {
     this.controllers.get(tabId)?.abort()
+    /*
+     * Also drop anything queued. "Stop" means stop — leaving prompts to fire
+     * afterwards would make the button appear not to have worked, which is a
+     * nastier surprise than losing a queue you can retype.
+     */
+    const session = this.sessions.get(tabId)
+    if (session?.queue.length) {
+      session.queue = []
+      this.persist()
+    }
   }
 
   /* ---------------------------------------------------------------------- */
   /*  The loop                                                               */
   /* ---------------------------------------------------------------------- */
 
+  /**
+   * Starts a task, or queues it if one is already running.
+   *
+   * Queueing rather than refusing is the difference between a request being
+   * captured and it being lost: the useful moment to type the next thing is
+   * while the current thing is still going, and being told to wait means
+   * remembering to come back. Queued prompts run in order, as soon as the
+   * current one finishes.
+   */
   async run(prompt: string, tabId: number): Promise<void> {
+    await this.ready()
     const session = this.sessionFor(tabId)
 
     if (this.isRunning(tabId)) {
-      throw new Error('WebPilot is already working in this tab. Stop it first.')
+      this.enqueue(session, prompt)
+      return
     }
 
     const settings = await loadSettings()
@@ -258,16 +371,20 @@ export class Agent {
     }
 
     /*
-     * Re-check after the await above. Two `agent/run` requests arriving in quick
-     * succession would both have passed the first check; the second would then
-     * replace the first run's controller, orphaning a run that is still going
-     * with no way to stop it.
+     * Re-check after the awaits above. Two `agent/run` requests arriving in quick
+     * succession both pass the first check; without this the second would replace
+     * the first run's controller, orphaning a run that is still going with no way
+     * to stop it. The second request is queued instead.
      */
-    if (this.isRunning(tabId)) return
+    if (this.isRunning(tabId)) {
+      this.enqueue(session, prompt)
+      return
+    }
 
     const abort = new AbortController()
     this.controllers.set(tabId, abort)
     this.rateLimiter.setLimit(settings.rateLimit)
+    this.draining.add(tabId)
 
     this.turnCounters.set(tabId, 1)
     this.addMessage(session, 'user', prompt)
@@ -514,8 +631,84 @@ export class Agent {
     } finally {
       // Only clear if this run still owns the controller — a newer run in the
       // same tab must not have its controller dropped by an older one unwinding.
-      if (this.controllers.get(tabId) === abort) this.controllers.delete(tabId)
+      if (this.controllers.get(tabId) === abort) {
+        this.controllers.delete(tabId)
+        this.draining.delete(tabId)
+        // Whatever was queued while this ran goes next, in order.
+        this.drain(tabId)
+      }
     }
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /*  Queue                                                                  */
+  /* ---------------------------------------------------------------------- */
+
+  private draining = new Set<number>()
+
+  /**
+   * Adds a prompt to the tab's queue.
+   *
+   * Recorded as a user message straight away, so the transcript shows what you
+   * asked and when — a queue that is invisible until it starts is a queue you
+   * cannot tell you are in. It is marked pending, and the mark is cleared when
+   * the prompt actually becomes the run.
+   */
+  private enqueue(session: Session, prompt: string): void {
+    session.queue = [...session.queue, prompt]
+    this.addMessage(session, 'user', prompt)
+    this.addStep(session, {
+      index: 0,
+      kind: 'note',
+      title: 'Queued — waiting for the current task to finish',
+      detail: truncate(prompt, 120),
+      ok: true,
+    })
+  }
+
+  /** Removes a queued prompt, if it has not started yet. */
+  unqueue(tabId: number, prompt: string): boolean {
+    const session = this.sessionFor(tabId)
+    const at = session.queue.indexOf(prompt)
+    if (at === -1) return false
+    session.queue = session.queue.filter((_, i) => i !== at)
+    this.emit(tabId, {
+      kind: 'step',
+      step: {
+        id: `s${tabId}_unqueue_${Date.now()}`,
+        turn: 0,
+        index: 0,
+        at: Date.now(),
+        kind: 'note',
+        title: 'Removed from the queue',
+        detail: truncate(prompt, 120),
+        ok: false,
+      },
+    })
+    return true
+  }
+
+  /**
+   * Starts the next queued prompt, if the tab is free.
+   *
+   * The `draining` flag stops two runs starting at once when a finish and a new
+   * enqueue land in the same tick — which is the common case, since finishing is
+   * what frees the tab.
+   */
+  private drain(tabId: number): void {
+    if (this.draining.has(tabId) || this.isRunning(tabId)) return
+    const session = this.sessionFor(tabId)
+    const next = session.queue[0]
+    if (next === undefined) return
+
+    session.queue = session.queue.slice(1)
+    this.draining.add(tabId)
+
+    // `run` clears the flag itself once it unwinds.
+    void this.run(next, tabId).catch((err) => {
+      this.draining.delete(tabId)
+      console.error('[WebPilot] queued run failed', err)
+    })
   }
 
   private isStopped(abort: AbortController, err: unknown): boolean {
@@ -585,7 +778,6 @@ export class Agent {
         ok: success,
       })
       this.setStatus(session, success ? 'done' : 'error', success ? 'Finished' : 'Needs you')
-      void clearHighlight(tabId).catch(() => {})
       return { content: 'Done.', ok: true, kind: 'finished' }
     }
 
@@ -600,7 +792,6 @@ export class Agent {
           kind: 'continue',
         }
       }
-      await clearHighlight(tabId)
       this.addStep(session, {
         ...step,
         kind: 'read',
@@ -821,9 +1012,6 @@ export class Agent {
     }
 
     /* -- build and run the operation ------------------------------------- */
-    // Box the target so the user can see where it is about to act.
-    this.highlight(tabId, ref)
-
     const before = snapshot?.url ?? ''
     const result = await this.runRefAction(call.name, args, ref, tabId)
     const after = await this.currentUrl(tabId)
@@ -923,16 +1111,6 @@ export class Agent {
     } catch {
       return ''
     }
-  }
-
-  /**
-   * Boxes the element an action is about to touch.
-   *
-   * Fire-and-forget: this is decoration, and a failure to draw a box must never
-   * affect whether the action happens.
-   */
-  private highlight(tabId: number, ref: string): void {
-    void setHighlight(tabId, [ref]).catch(() => {})
   }
 
   /**

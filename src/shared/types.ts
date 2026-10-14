@@ -227,6 +227,8 @@ export type AgentSessionState = {
    * the tokens.
    */
   turns: Record<number, { thinking: string, answer: string }>
+  /** Prompts waiting to run, in order. */
+  queue: string[]
   note?: string
 }
 
@@ -275,6 +277,8 @@ export type BgRequest =
   | { type: 'agent/answer', id: string, answer: string }
   | { type: 'agent/approve', id: string, approved: boolean }
   | { type: 'agent/clear' }
+  /** Removes a queued prompt that has not started yet. */
+  | { type: 'agent/unqueue', prompt: string }
   | { type: 'agent/state' }
   | { type: 'settings/get' }
   | { type: 'settings/set', patch: Partial<Settings> }
@@ -293,14 +297,6 @@ export type BgRequest =
 export type FrameRequest =
   | { type: 'frame/exec', op: AgentOp, frameId: number, budget?: Partial<ReadBudget> }
   | { type: 'frame/read', budget?: Partial<ReadBudget> }
-  | {
-      type: 'frame/highlight'
-      on: boolean
-      /** Refs to box. Usually one — the element being acted on. */
-      refs?: string[]
-      /** Pulse them briefly, to make the action visible as it happens. */
-      flash?: boolean
-    }
   | {
       type: 'frame/annotate'
       dataUrl: string

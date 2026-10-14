@@ -296,5 +296,6 @@ export const EMPTY_SESSION: AgentSessionState = {
   approval: null,
   stream: EMPTY_STREAM,
   turns: {},
+  queue: [],
   tabId: null,
 }

@@ -91,12 +91,25 @@ back. Click any row to see the tool arguments and result. The element the agent
 is about to act on is boxed in the page, so you can see where it is about to
 click without the overlay burying the site under outlines.
 
+### Queueing
+
+Type your next request while a task is still running and it queues rather than
+being refused — because the useful moment to think of the next thing is while the
+current thing is still going. Queued prompts are listed above the input with a
+number and a way to remove each one, and they run in order as soon as the current
+task finishes. **Stop** clears the queue as well as the run.
+
 ### Chats are per tab
 
 Each tab has its own conversation. Switch tabs and you switch chats — a task
 running in one tab keeps running while you look at another, and coming back to it
 shows it exactly where it was. The toolbar badge marks which tab is busy, so you
 can see that from anywhere.
+
+Conversations are written to disk as they happen, so they survive the browser
+shutting the extension down. Firefox unloads an idle background script as a
+matter of course, and without this a running task would come back as an empty
+chat.
 
 ### Thinking
 

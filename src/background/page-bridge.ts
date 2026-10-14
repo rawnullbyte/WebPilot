@@ -382,53 +382,6 @@ function shouldMarkStale(op: AgentOp, ok: boolean): boolean {
 }
 
 /* -------------------------------------------------------------------------- */
-/*  Highlighting                                                               */
-/* -------------------------------------------------------------------------- */
-
-/**
- * Boxes one or more elements in the page, given page-wide refs.
- *
- * Refs are grouped by frame and each frame is told only about its own elements —
- * a frame cannot resolve another frame's refs, and sending it a ref it does not
- * recognise would silently draw nothing.
- */
-export async function setHighlight(
-  tabId: number,
-  refs: string[],
-  flash = false,
-): Promise<void> {
-  const byFrame = new Map<number, string[]>()
-  for (const ref of refs) {
-    const { frameId, localRef } = resolveRef(ref)
-    const list = byFrame.get(frameId) ?? []
-    list.push(localRef)
-    byFrame.set(frameId, list)
-  }
-
-  await Promise.all(
-    [...byFrame.entries()].map(([frameId, localRefs]) =>
-      askFrame(tabId, frameId, { type: 'frame/highlight', on: true, refs: localRefs, flash }),
-    ),
-  )
-}
-
-/** Splits a page-wide ref into the frame it names and the ref within it. */
-function resolveRef(ref: string): { frameId: number, localRef: string } {
-  const m = /^f(\d+):(.+)$/.exec(ref)
-  return m ? { frameId: Number(m[1]), localRef: m[2] } : { frameId: 0, localRef: ref }
-}
-
-/** Removes every highlight box from the tab. */
-export async function clearHighlight(tabId: number): Promise<void> {
-  const frames = await listFrames(tabId)
-  await Promise.all(
-    frames
-      .slice(0, READ_BUDGET.maxFrames)
-      .map((f) => askFrame(tabId, f.frameId, { type: 'frame/highlight', on: false })),
-  )
-}
-
-/* -------------------------------------------------------------------------- */
 /*  Rendering a snapshot for the model                                         */
 /* -------------------------------------------------------------------------- */
 

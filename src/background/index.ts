@@ -30,6 +30,7 @@ import { ext, isConfigured, loadSettings, saveSettings } from '@/shared/settings
 import type { BgEvent, BgRequest, Settings as SettingsType, UiSurface } from '@/shared/types'
 import { agent } from './agent'
 import { getModels, testSettings } from './actions'
+import { pruneSessions } from './sessions-store'
 
 /* -------------------------------------------------------------------------- */
 /*  UI registry                                                                */
@@ -253,6 +254,15 @@ agent.setAsker({
 /* -------------------------------------------------------------------------- */
 
 async function handleRequest(req: BgRequest, tabId: number | null): Promise<unknown> {
+  /*
+   * Wait for the stored sessions to come back before answering anything.
+   *
+   * This is the first thing every request does, because serving a request from a
+   * half-restored state would present an empty transcript for a tab that has
+   * one — which is precisely the symptom of the bug persistence exists to fix.
+   */
+  await agent.ready()
+
   const requireTab = (): number => {
     if (tabId == null) throw new Error('No tab to work on.')
     return tabId
@@ -293,6 +303,9 @@ async function handleRequest(req: BgRequest, tabId: number | null): Promise<unkn
     case 'agent/clear':
       agent.clear(requireTab())
       return { ok: true }
+
+    case 'agent/unqueue':
+      return { ok: agent.unqueue(requireTab(), req.prompt) }
 
     case 'agent/state':
       // The session for the requesting tab, or every session when the caller is
@@ -433,25 +446,31 @@ ext.runtime.onConnect.addListener((port) => {
        * whichever tab the user is looking at, since that is the conversation a
        * popup should be reporting on. Without this it would show a blank state
        * until the first live event arrived.
+       *
+       * `agent.ready()` first, always: after a background restart the sessions
+       * are still being read back from storage, and sending state before that
+       * finishes would hand this panel an empty transcript for a tab that has
+       * one — the exact symptom persistence was added to remove.
        */
-      if (entry.tabId == null) {
-        void activeTabId().then((id) => {
-          if (id == null || !entry) return
-          entry.tabId = id
-          const session = agent.sessionFor(id)
-          try {
-            port.postMessage({ type: 'agent/state', tabId: id, session } satisfies BgEvent)
-          } catch {
-            /* panel went away */
-          }
-        })
-        return
-      }
+      void (async () => {
+        await agent.ready()
+        // `entry` is captured by the closure below and may have been replaced by
+        // a re-registration in the meantime; bail if that happened.
+        const target = entry
+        if (!target || target.port !== port) return
 
-      {
-        const session = agent.sessionFor(entry.tabId)
+        if (target.tabId == null) {
+          const id = await activeTabId()
+          if (id == null || entry !== target) return
+          target.tabId = id
+        }
+
+        const tabId = target.tabId
+        if (tabId == null) return
+
+        const session = agent.sessionFor(tabId)
         try {
-          port.postMessage({ type: 'agent/state', tabId: entry.tabId, session } satisfies BgEvent)
+          port.postMessage({ type: 'agent/state', tabId, session } satisfies BgEvent)
 
           // If the agent is blocked on a prompt, re-raise it here too: a panel
           // opened after the fact must still be able to answer it.
@@ -473,7 +492,7 @@ ext.runtime.onConnect.addListener((port) => {
         } catch {
           /* panel went away */
         }
-      }
+      })()
       return
     }
 
@@ -574,4 +593,46 @@ ext.webNavigation.onCommitted.addListener(async (details) => {
   await ensureOverlay(details.tabId)
 })
 
-console.info('[WebPilot] background ready')
+/*
+ * Flush when the event page is about to be suspended.
+ *
+ * `runtime.onSuspend` is the API for this; the DOM `unload` event is not, and a
+ * listener on it would simply never fire.
+ *
+ * This is best effort and is treated as such. The callback cannot usefully await
+ * anything — the page is being torn down regardless — so the *real* guarantee
+ * comes from the debounced save after every mutation, which keeps the gap
+ * between what is in memory and what is on disk down to a few hundred
+ * milliseconds. What this adds is a chance to close that gap entirely on a clean
+ * suspension, which is the common case.
+ */
+ext.runtime.onSuspend?.addListener(() => {
+  void agent.flush()
+})
+
+/*
+ * The same flush, reachable from outside.
+ *
+ * Assigning onto `globalThis` is not the usual way to expose anything, and here
+ * it is deliberate: the background bundle runs in its own scope inside the
+ * browser (and inside a test sandbox), and this is the one handle a test needs to
+ * simulate a suspension. It is inert in production — nothing calls it.
+ */
+;(globalThis as unknown as { __webpilotFlush?: () => Promise<void> }).__webpilotFlush = () =>
+  agent.flush()
+
+void agent.ready().then(() => console.info('[WebPilot] background ready'))
+
+/*
+ * Drop sessions for tabs that closed while the background was asleep. A
+ * `tabs.onRemoved` listener only fires while the event page is awake, so a tab
+ * closed during a shutdown would otherwise leave its transcript stored forever.
+ */
+void agent.ready().then(async () => {
+  try {
+    const tabs = await ext.tabs.query({})
+    await pruneSessions(new Set(tabs.map((t) => t.id).filter((id): id is number => id != null)))
+  } catch {
+    /* not worth reporting; the cap in the store still bounds growth */
+  }
+})

@@ -119,13 +119,23 @@ async function main() {
     errors.push(`expected manifest_version 3, found ${manifest.manifest_version}`)
   }
 
-  // Firefox MV3 defaults background scripts to non-persistent, but the agent
-  // holds in-memory state across a run. An explicit `persistent: false` with a
-  // service-worker-shaped design would silently lose the transcript.
-  if (manifest.background?.scripts && manifest.background.persistent !== false) {
-    warnings.push(
-      "background.persistent is not set to false; Firefox will default it for MV3, " +
-        "but being explicit avoids surprises",
+  /*
+   * `background.persistent` is a Manifest V2 key. In MV3 the background is an
+   * event page by definition, and Firefox rejects the property outright:
+   *
+   *   Error processing background: Property "persistent" is unsupported in
+   *   Manifest Version 3
+   *
+   * A previous version of this check *required* it, on the reasoning that the
+   * agent holds state across a run and should not be unloaded. That was wrong on
+   * both counts: the key is not accepted, and being unloadable is not something a
+   * manifest key can prevent. State has to survive a restart instead — see the
+   * persistence in agent.ts.
+   */
+  if ('persistent' in (manifest.background ?? {})) {
+    errors.push(
+      'background.persistent is a Manifest V2 key and Firefox rejects it in MV3. ' +
+        'An MV3 background is an event page; make state survive a restart instead.',
     )
   }
 

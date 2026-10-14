@@ -48,7 +48,7 @@ const CODE = bundle.outputFiles[0].text
  * script wired up, and the `runtime.onMessage` handler is exposed so requests
  * can be driven through it exactly as Firefox would.
  */
-function loadBackground({ storage = {} } = {}) {
+function loadBackground({ storage = {}, hangingFetch = false } = {}) {
   const listeners = {
     message: [],
     connect: [],
@@ -159,7 +159,15 @@ function loadBackground({ storage = {} } = {}) {
     TextDecoder,
     URL,
     URLSearchParams,
-    fetch: async () => new Response("{}", { status: 200 }),
+    /*
+     * A run is only interesting to these tests while it is *in flight*, and the
+     * default stub resolves immediately — so every task finishes before the test
+     * can queue anything behind it. `hangingFetch` keeps the request open, which
+     * is what a real model call looks like from the background's point of view.
+     */
+    fetch: hangingFetch
+      ? () => new Promise(() => {})
+      : async () => new Response("{}", { status: 200 }),
     Response,
     ReadableStream,
     // Deliberately absent: window, document, navigator, location, getComputedStyle.
@@ -202,7 +210,13 @@ function loadBackground({ storage = {} } = {}) {
     return { port, received, handlers }
   }
 
-  return { threw, listeners, calls, warnings, request, connectPanel, sandbox, storage }
+  /** Writes everything to the (shared) storage object, as a real shutdown would. */
+  const flush = async () => {
+    const handler = sandbox.__webpilotFlush
+    if (typeof handler === "function") await handler()
+  }
+
+  return { threw, listeners, calls, warnings, request, connectPanel, sandbox, storage, flush }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -328,9 +342,11 @@ await test("falls back to the in-page panel", async () => {
 
 section("panels")
 
-await test("a connecting panel is sent its tab's state", () => {
+await test("a connecting panel is sent its tab's state", async () => {
   const fresh = loadBackground()
   const panel = fresh.connectPanel("sidebar", 1)
+  // The send awaits the session restore, so give it a tick to land.
+  await new Promise((r) => setTimeout(r, 20))
   const state = panel.received.find((m) => m.type === "agent/state")
   assert.ok(state, `the panel was not sent initial state; got: ${panel.received.map((m) => m.type).join(", ")}`)
   assert.equal(state.tabId, 1, "the snapshot did not say which tab it describes")
@@ -408,6 +424,141 @@ await test("agent/run is refused when there is no tab at all", async () => {
   bare.sandbox.chrome.tabs.query = async () => []
   const res = await bare.request({ type: "agent/run", prompt: "go" }).catch((e) => ({ error: e.message }))
   assert.ok(res.error || res.ok === false, "a run with no tab should be refused")
+})
+
+section("surviving a background restart")
+
+await test("a session is restored after the background restarts", async () => {
+  /*
+   * An MV3 background is an event page: Firefox unloads it when idle and starts
+   * it again on the next event, taking every in-memory session with it. A panel
+   * then reconnects and gets handed an empty session — which is what "the chat
+   * randomly resets to a fresh one" actually was.
+   *
+   * So: run something, discard the whole background, start a new one against the
+   * same storage, and check the transcript is still there.
+   */
+  const storage = {}
+
+  const first = loadBackground({ storage, hangingFetch: true })
+  await first.request({ type: "settings/set", patch: { endpoint: "https://x.test/v1", model: "m" } })
+  await first.request({ type: "agent/run", prompt: "remember me" })
+  await new Promise((r) => setTimeout(r, 40))
+  await first.flush()
+
+  // Everything above is now only on disk.
+  const second = loadBackground({ storage })
+  const res = await second.request({ type: "agent/state" })
+
+  const session = res.sessions?.find((s) => s.tabId === 1) ?? res.session
+  assert.ok(session, `no session after restart; got ${JSON.stringify(res).slice(0, 200)}`)
+  assert.ok(
+    session.messages.some((m) => m.text === "remember me"),
+    "the transcript did not survive the restart",
+  )
+})
+
+await test("a queued prompt survives a restart", async () => {
+  const storage = {}
+  // Hanging, so the queue is still a queue when the restart happens.
+  const first = loadBackground({ storage, hangingFetch: true })
+  await first.request({ type: "settings/set", patch: { endpoint: "https://x.test/v1", model: "m" } })
+
+  // Queue two while nothing is running, then restart before they drain.
+  await first.request({ type: "agent/run", prompt: "first" })
+  await first.request({ type: "agent/run", prompt: "second" })
+  await new Promise((r) => setTimeout(r, 30))
+  await first.flush()
+
+  const second = loadBackground({ storage, hangingFetch: true })
+  const res = await second.request({ type: "agent/state" })
+  // A one-shot request resolves a tab, so it gets `session`; an unscoped port
+  // would get `sessions`. Accept either.
+  const session = res.session ?? res.sessions?.find((s) => s.tabId === 1)
+  assert.ok(session, `no session after restart; got ${JSON.stringify(res).slice(0, 160)}`)
+  assert.ok(
+    session.queue.includes("second") || session.messages.some((m) => m.text === "second"),
+    `the queued prompt was lost; queue=${JSON.stringify(session.queue)}`,
+  )
+})
+
+await test("a corrupt store does not stop the extension starting", async () => {
+  // A bad value on disk must leave the extension working empty, not refusing to
+  // load at all — there is nothing useful to do with it except ignore it.
+  const bg = loadBackground({ storage: { "webpilot.sessions": "not-an-array" } })
+  assert.equal(bg.threw, null, "a corrupt store took down the background")
+  const res = await bg.request({ type: "settings/get" })
+  assert.ok(res.settings, "the extension did not start properly")
+})
+
+section("queueing")
+
+await test("a request made while busy is queued, not refused", async () => {
+  const fresh = loadBackground({ hangingFetch: true })
+  fresh.connectPanel("sidebar", 1)
+  await fresh.request({ type: "settings/set", patch: { endpoint: "https://x.test/v1", model: "m" } })
+
+  await fresh.request({ type: "agent/run", prompt: "first" })
+  // Immediately, while the first is still starting.
+  const res = await fresh.request({ type: "agent/run", prompt: "second" })
+
+  assert.equal(res.ok, true, `the follow-up was refused: ${JSON.stringify(res)}`)
+})
+
+await test("a queued prompt appears in the transcript straight away", async () => {
+  /*
+   * A queue that is invisible until it starts is a queue you cannot tell you are
+   * in. The prompt is recorded when it is queued, so the panel shows what you
+   * asked and when.
+   */
+  const fresh = loadBackground()
+  fresh.connectPanel("sidebar", 1)
+  await fresh.request({ type: "settings/set", patch: { endpoint: "https://x.test/v1", model: "m" } })
+
+  await fresh.request({ type: "agent/run", prompt: "first" })
+  await fresh.request({ type: "agent/run", prompt: "queued one" })
+  await new Promise((r) => setTimeout(r, 30))
+
+  const res = await fresh.request({ type: "agent/state" })
+  assert.ok(
+    res.session.messages.some((m) => m.text === "queued one"),
+    "the queued prompt was not recorded",
+  )
+})
+
+await test("a queued prompt can be removed", async () => {
+  const fresh = loadBackground({ hangingFetch: true })
+  fresh.connectPanel("sidebar", 1)
+  await fresh.request({ type: "settings/set", patch: { endpoint: "https://x.test/v1", model: "m" } })
+
+  await fresh.request({ type: "agent/run", prompt: "first" })
+  await fresh.request({ type: "agent/run", prompt: "take it back" })
+  await new Promise((r) => setTimeout(r, 30))
+
+  const removed = await fresh.request({ type: "agent/unqueue", prompt: "take it back" })
+  assert.equal(removed.ok, true, "the queued prompt could not be removed")
+
+  const res = await fresh.request({ type: "agent/state" })
+  assert.ok(
+    !res.session.queue.includes("take it back"),
+    "the removed prompt is still queued",
+  )
+})
+
+await test("stopping clears the queue", async () => {
+  // "Stop" means stop. Leaving prompts to fire afterwards would make the button
+  // appear not to have worked.
+  const fresh = loadBackground()
+  fresh.connectPanel("sidebar", 1)
+  await fresh.request({ type: "settings/set", patch: { endpoint: "https://x.test/v1", model: "m" } })
+
+  await fresh.request({ type: "agent/run", prompt: "first" })
+  await fresh.request({ type: "agent/run", prompt: "and this" })
+  await new Promise((r) => setTimeout(r, 30))
+
+  await fresh.request({ type: "agent/stop" })
+  const res = await fresh.request({ type: "agent/state" })
+  assert.equal(res.session.queue.length, 0, `queue survived a stop: ${JSON.stringify(res.session.queue)}`)
 })
 
 section("storage changes")

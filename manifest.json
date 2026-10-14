@@ -24,8 +24,7 @@
   "host_permissions": ["<all_urls>"],
 
   "background": {
-    "scripts": ["src/background/background.js"],
-    "persistent": false
+    "scripts": ["src/background/background.js"]
   },
 
   "content_scripts": [

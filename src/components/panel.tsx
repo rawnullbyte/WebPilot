@@ -68,7 +68,8 @@ export function Panel({
    */
   tabId?: number | null
 }) {
-  const { session, settings, prompt, run, stop, clear, answer, approve, error } = usePanel(surface, tabId)
+  const { session, settings, prompt, run, stop, clear, unqueue, answer, approve, error } =
+    usePanel(surface, tabId)
 
   const running = session.status === 'working' || session.status === 'waiting'
   const configured = Boolean(settings?.endpoint && settings?.model)
@@ -207,6 +208,38 @@ export function Panel({
 
           {prompt && (
             <PromptCard prompt={prompt} onAnswer={answer} onApprove={approve} />
+          )}
+
+          {session.queue.length > 0 && (
+            <div className="mx-3 mb-2 space-y-1">
+              {/*
+                A visible queue, with a way out of each entry. A queue you cannot
+                see is a queue you cannot tell you are in — and one you cannot
+                cancel is worse, because the only way back is to wait for
+                everything ahead of it.
+              */}
+              {session.queue.map((queued, i) => (
+                <div
+                  key={`${i}-${queued}`}
+                  className="flex items-center gap-2 rounded-md border border-border bg-muted/40 px-2 py-1"
+                >
+                  <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
+                    {i + 1}
+                  </span>
+                  <span className="min-w-0 flex-1 truncate text-[11px] text-muted-foreground">
+                    {queued}
+                  </span>
+                  <Button
+                    variant="ghost"
+                    size="icon-xs"
+                    onClick={() => unqueue(queued)}
+                    aria-label="Remove from the queue"
+                  >
+                    <X className="size-3" />
+                  </Button>
+                </div>
+              ))}
+            </div>
           )}
 
           {session.status === 'done' || session.status === 'error' || session.status === 'stopped' ? (

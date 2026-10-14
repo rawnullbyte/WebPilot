@@ -22,6 +22,7 @@ export type PanelApi = {
   run(prompt: string): Promise<void>
   stop(): void
   clear(): void
+  unqueue(prompt: string): void
   answer(id: string, answer: string): void
   approve(id: string, approved: boolean): void
   save(patch: Partial<Settings>): Promise<void>
@@ -166,6 +167,13 @@ export function usePanel(surface: UiSurface, tabId?: number | null): PanelApi {
     void client.request({ type: 'agent/stop' }).catch(() => {})
   }, [client])
 
+  const unqueue = React.useCallback(
+    (prompt: string) => {
+      void client.request({ type: 'agent/unqueue', prompt }).catch(() => {})
+    },
+    [client],
+  )
+
   const clear = React.useCallback(() => {
     void client.request({ type: 'agent/clear' }).catch(() => {})
   }, [client])
@@ -192,5 +200,5 @@ export function usePanel(surface: UiSurface, tabId?: number | null): PanelApi {
     [client],
   )
 
-  return { session, settings, prompt, ready, run, stop, clear, answer, approve, save, error }
+  return { session, settings, prompt, ready, run, stop, clear, unqueue, answer, approve, save, error }
 }

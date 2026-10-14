@@ -140,6 +140,37 @@ function Detail({ label, value }: { label: string, value: string }) {
 }
 
 /* -------------------------------------------------------------------------- */
+/*  The user's own messages                                                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A prompt the user typed.
+ *
+ * These were previously invisible: the timeline rendered `steps`, which the agent
+ * produces, and user messages live in `messages`, which nothing drew. So the
+ * transcript showed a sequence of actions with no indication of what had been
+ * asked for — and the request that started the whole task was not on screen at
+ * all.
+ *
+ * Visually distinct from a step, because it is a different kind of thing: a step
+ * is something the agent did, a prompt is something you said.
+ */
+function PromptRow({ text, at }: { text: string, at: number }) {
+  const time = new Date(at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  return (
+    <div className="mx-3 mb-2 mt-1 rounded-lg border border-running/25 bg-running/5 px-2.5 py-1.5">
+      <div className="mb-0.5 flex items-baseline gap-2">
+        <span className="text-[10px] font-medium tracking-wide text-running uppercase">You</span>
+        <span className="text-[10px] text-muted-foreground">{time}</span>
+      </div>
+      <p className="text-[13px] leading-snug whitespace-pre-wrap break-words text-foreground">
+        {text}
+      </p>
+    </div>
+  )
+}
+
+/* -------------------------------------------------------------------------- */
 /*  Thinking                                                                   */
 /* -------------------------------------------------------------------------- */
 
@@ -297,17 +328,6 @@ function TurnDisclosure({
 /*  The timeline                                                               */
 /* -------------------------------------------------------------------------- */
 
-/** Splits steps into runs sharing a turn number, preserving order. */
-function groupByTurn(steps: Step[]): { turn: number, steps: Step[] }[] {
-  const groups: { turn: number, steps: Step[] }[] = []
-  for (const step of steps) {
-    const turn = step.turn ?? 0
-    const last = groups[groups.length - 1]
-    if (last && last.turn === turn) last.steps.push(step)
-    else groups.push({ turn, steps: [step] })
-  }
-  return groups
-}
 
 export function Timeline({
   session,
@@ -316,7 +336,25 @@ export function Timeline({
   session: AgentSessionState
   className?: string
 }) {
-  const { steps, status } = session
+  const { steps, status, messages } = session
+
+  /*
+   * Prompts and steps merged into one ordered list.
+   *
+   * Each prompt is placed immediately before the first step that came after it.
+   * Timestamps rather than array positions, because the two are separate streams
+   * — `messages` and `steps` — and position-in-array says nothing about order
+   * across them. A prompt can also arrive with no steps after it yet, which is
+   * the queued case, and it lands at the end where it belongs.
+   */
+  const entries = React.useMemo(() => {
+    const prompts = messages
+      .filter((m) => m.role === 'user')
+      .map((m) => ({ kind: 'prompt' as const, at: m.at, text: m.text, id: m.id }))
+    const rows = steps.map((step) => ({ kind: 'step' as const, at: step.at, step }))
+    return [...prompts, ...rows].sort((a, b) => a.at - b.at)
+  }, [messages, steps])
+
   const endRef = React.useRef<HTMLDivElement>(null)
   const scroller = React.useRef<HTMLDivElement>(null)
 
@@ -332,28 +370,61 @@ export function Timeline({
 
   React.useEffect(() => {
     if (follow) endRef.current?.scrollIntoView({ block: 'end' })
-  }, [steps.length, follow])
+  }, [entries.length, follow])
 
-  if (!steps.length) return null
+  if (!entries.length) return null
 
-  const groups = groupByTurn(steps)
-  const newestTurn = groups[groups.length - 1]?.turn
+  /*
+   * Grouped for display: a turn's steps hang together under one collapsible
+   * record of the reasoning that produced them, and prompts sit between the
+   * groups as their own kind of row.
+   */
+  const items: (
+    | { kind: 'prompt', id: string, text: string, at: number }
+    | { kind: 'turn', turn: number, steps: Step[] }
+  )[] = []
+  {
+    let current: Step[] = []
+    const flush = () => {
+      if (!current.length) return
+      items.push({ kind: 'turn', turn: current[0].turn ?? 0, steps: current })
+      current = []
+    }
+    for (const entry of entries) {
+      if (entry.kind === 'prompt') {
+        flush()
+        items.push({ kind: 'prompt', id: entry.id, text: entry.text, at: entry.at })
+      } else {
+        current.push(entry.step)
+      }
+    }
+    flush()
+  }
+
+  const lastTurn = [...items].reverse().find((i) => i.kind === 'turn')
+  const newestTurn = lastTurn?.kind === 'turn' ? lastTurn.turn : -1
+  const lastStepId = steps[steps.length - 1]?.id
 
   return (
     <div ref={scroller} onScroll={onScroll} className={cn('wp-scroll overflow-y-auto', className)}>
       <div className="py-1">
-        {groups.map((group) => {
-          const recorded = session.turns[group.turn]
-          const actions = group.steps.filter((s) => s.kind !== 'read' && s.kind !== 'note')
+        {items.map((item) => {
+          if (item.kind === 'prompt') {
+            return <PromptRow key={`p-${item.id}`} text={item.text} at={item.at} />
+          }
+
+          const recorded = session.turns[item.turn]
+          const actions = item.steps.filter((s) => s.kind !== 'read' && s.kind !== 'note')
+
           return (
-            <div key={`turn-${group.turn}`} className="mb-0.5">
+            <div key={`turn-${item.turn}`} className="mb-0.5">
               {/*
                 The turn's reasoning, above the actions it produced. For the turn
                 currently streaming, the live box in the panel header is already
-                showing this, so it is suppressed here to avoid saying it twice —
+                showing it, so it is suppressed here to avoid saying it twice —
                 and it appears the moment the turn finishes.
               */}
-              {recorded && group.turn !== newestTurn && (
+              {recorded && item.turn !== newestTurn && (
                 <TurnDisclosure
                   thinking={recorded.thinking}
                   answer={recorded.answer}
@@ -361,12 +432,8 @@ export function Timeline({
                   defaultOpen={false}
                 />
               )}
-              {group.steps.map((step, i) => (
-                <StepRow
-                  key={step.id}
-                  step={step}
-                  last={i === group.steps.length - 1 && status !== 'working'}
-                />
+              {item.steps.map((step) => (
+                <StepRow key={step.id} step={step} last={step.id === lastStepId && status !== 'working'} />
               ))}
             </div>
           )

@@ -795,106 +795,6 @@ function readFrame(budget: ReadBudget): FrameRead {
 }
 
 /* -------------------------------------------------------------------------- */
-/*  Highlight overlay                                                          */
-/* -------------------------------------------------------------------------- */
-
-let highlightHost: HTMLElement | null = null
-
-/**
- * Draws a box around what the agent is working with.
- *
- * Deliberately *only* that. An earlier version boxed and numbered every element
- * it could address, which sounds informative and is actually unusable: a real
- * page has hundreds of them, so the overlay buried the site under a lattice and
- * the numbers carried no information the transcript did not already have. What
- * you actually want to see is which control the agent is touching right now, and
- * one box answers that without covering anything.
- *
- * No text label either, for the same reason — the step in the panel already says
- * what is being clicked, so the box only needs to say *where*.
- */
-function setHighlight(refs: string[], flash = false): void {
-  if (!refs.length) {
-    clearHighlight()
-    return
-  }
-
-  if (!highlightHost) {
-    highlightHost = document.createElement('div')
-    highlightHost.setAttribute('data-webpilot-ui', 'highlight')
-    Object.assign(highlightHost.style, {
-      position: 'fixed',
-      inset: '0',
-      pointerEvents: 'none',
-      zIndex: '2147483646',
-    } satisfies Partial<CSSStyleDeclaration>)
-    const root = highlightHost.attachShadow({ mode: 'open' })
-    root.innerHTML = `<style>
-      .wp-box{
-        position:fixed;box-sizing:border-box;border-radius:4px;
-        border:2px solid rgba(47,111,237,.9);
-        box-shadow:0 0 0 1px rgba(255,255,255,.55), 0 2px 10px rgba(47,111,237,.25);
-        pointer-events:none;
-      }
-      /*
-       * A brief pulse when an action fires, so a click is legible even when it
-       * lands somewhere you were not looking.
-       */
-      .wp-box.flash{animation:wp-pulse .5s ease-out}
-      @keyframes wp-pulse{
-        0%{background:rgba(47,111,237,.28)}
-        100%{background:transparent}
-      }
-      @media (prefers-reduced-motion: reduce){
-        .wp-box.flash{animation:none}
-      }
-    </style>`
-    ;(document.documentElement ?? document.body).appendChild(highlightHost)
-
-    // A fixed overlay has to be redrawn as the page moves under it.
-    const redraw = () => drawBoxes(lastRefs)
-    window.addEventListener('scroll', redraw, { passive: true, capture: true })
-    window.addEventListener('resize', redraw, { passive: true })
-  }
-
-  lastRefs = refs
-  drawBoxes(refs, flash)
-}
-
-let lastRefs: string[] = []
-
-function clearHighlight(): void {
-  lastRefs = []
-  const root = highlightHost?.shadowRoot
-  root?.querySelectorAll('.wp-box').forEach((n) => n.remove())
-}
-
-function drawBoxes(refs: string[], flash = false): void {
-  const root = highlightHost?.shadowRoot
-  if (!root) return
-
-  root.querySelectorAll('.wp-box').forEach((n) => n.remove())
-
-  for (const ref of refs) {
-    const el = registry.get(ref)
-    if (!el || !el.isConnected) continue
-
-    const r = el.getBoundingClientRect()
-    if (r.width < 2 && r.height < 2) continue
-
-    const box = document.createElement('div')
-    box.className = flash ? 'wp-box flash' : 'wp-box'
-    Object.assign(box.style, {
-      left: `${r.left}px`,
-      top: `${r.top}px`,
-      width: `${r.width}px`,
-      height: `${r.height}px`,
-    })
-    root.appendChild(box)
-  }
-}
-
-/* -------------------------------------------------------------------------- */
 /*  Acting on a frame                                                          */
 /* -------------------------------------------------------------------------- */
 
@@ -1574,16 +1474,6 @@ function handleMessage(msg: any, _sender: unknown, sendResponse: (r: any) => voi
     return true // async response
   }
 
-  if (msg?.type === 'frame/highlight') {
-    try {
-      if (msg.on === false) clearHighlight()
-      else setHighlight(msg.refs ?? [], Boolean(msg.flash))
-      sendResponse({ ok: true })
-    } catch (err) {
-      sendResponse({ ok: false, error: String(err) })
-    }
-    return false
-  }
 
   if (msg?.type === 'frame/annotate') {
     annotate(msg.dataUrl, msg.marks ?? [], msg.viewportWidth ?? window.innerWidth)

@@ -62,9 +62,16 @@ export function Composer({
     if (needed > el.clientHeight) el.style.height = `${needed}px`
   }, [value])
 
+  /*
+   * Sending is allowed while a task is running: it queues.
+   *
+   * Being told to wait for the current task before typing the next one means
+   * holding it in your head and remembering to come back. Queueing captures it
+   * at the moment you thought of it.
+   */
   const submit = () => {
     const text = value.trim()
-    if (!text || running || disabled) return
+    if (!text || disabled) return
     setValue('')
     onSubmit(text)
   }
@@ -87,7 +94,13 @@ export function Composer({
         onKeyDown={onKeyDown}
         rows={1}
         disabled={disabled}
-        placeholder={disabled ? (placeholder ?? 'Add your endpoint in Settings first') : (placeholder ?? 'Ask WebPilot to do something on this page…')}
+        placeholder={
+          disabled
+            ? (placeholder ?? 'Add your endpoint in Settings first')
+            : running
+              ? 'Type to queue a follow-up…'
+              : (placeholder ?? 'Ask WebPilot to do something on this page…')
+        }
         /* `h-9` matches the button's own height exactly — the two sit side by
            side, so any difference between them reads as a mistake. `py-0`
            with a `leading-9` line-height centres the text in that fixed
@@ -95,16 +108,24 @@ export function Composer({
         className="h-9 min-h-9 resize-none px-3 py-0 text-[13px] leading-9"
       />
       {running ? (
-        <Button
-          type="button"
-          size="icon"
-          variant="destructive"
-          onClick={onStop}
-          title="Stop"
-          className="size-9 shrink-0"
-        >
-          <Square className="size-4 fill-current" />
-        </Button>
+        <div className="flex shrink-0 items-center gap-1.5">
+          {/* Queue the current text, then a separate control to stop. */}
+          {value.trim() && (
+            <Button type="button" size="icon" onClick={submit} title="Queue this message">
+              <ArrowUp className="size-4" />
+            </Button>
+          )}
+          <Button
+            type="button"
+            size="icon"
+            variant="destructive"
+            onClick={onStop}
+            title="Stop"
+            className="size-9 shrink-0"
+          >
+            <Square className="size-4 fill-current" />
+          </Button>
+        </div>
       ) : (
         <Button
           type="button"
