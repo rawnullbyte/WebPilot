@@ -482,6 +482,93 @@ await test("a queued prompt survives a restart", async () => {
   )
 })
 
+await test("an interrupted run does not come back claiming to be running", async () => {
+  /*
+   * The failure this guards: a session saved mid-run restores with status
+   * "working", but the run itself is gone. Then `isRunning` stays true so every
+   * new prompt is queued behind a task that will never finish, the Stop button
+   * aborts a controller that no longer exists, and the panel shows "Working…"
+   * with nothing streaming — indefinitely, with no way out.
+   */
+  const storage = {}
+
+  const first = loadBackground({ storage, hangingFetch: true })
+  await first.request({ type: "settings/set", patch: { endpoint: "https://x.test/v1", model: "m" } })
+  await first.request({ type: "agent/run", prompt: "start something" })
+  await new Promise((r) => setTimeout(r, 40))
+  await first.flush()
+
+  // Confirm it really was saved mid-run, or the test proves nothing.
+  const saved = storage["webpilot.sessions"]?.find((x) => x.tabId === 1)
+  assert.equal(saved?.status, "working", "the fixture did not capture a running session")
+
+  const second = loadBackground({ storage, hangingFetch: true })
+  const res = await second.request({ type: "agent/state" })
+  const session = res.session ?? res.sessions?.find((x) => x.tabId === 1)
+
+  assert.notEqual(session.status, "working", "the session came back claiming to be running")
+  assert.notEqual(session.status, "waiting")
+  assert.equal(session.status, "error", `expected a terminal status, got ${session.status}`)
+  assert.ok(
+    session.steps.some((st) => /interrupted/i.test(st.title)),
+    "the interruption was not explained in the transcript",
+  )
+})
+
+await test("stop ends a live run", async () => {
+  // The control the user reaches for when it looks stuck must always work.
+  const fresh = loadBackground({ hangingFetch: true })
+  fresh.connectPanel("sidebar", 1)
+  await fresh.request({ type: "settings/set", patch: { endpoint: "https://x.test/v1", model: "m" } })
+  await fresh.request({ type: "agent/run", prompt: "run forever" })
+  await new Promise((r) => setTimeout(r, 30))
+
+  const before = await fresh.request({ type: "agent/state" })
+  assert.equal(before.session.status, "working", "the fixture did not start a run")
+
+  await fresh.request({ type: "agent/stop" })
+  await new Promise((r) => setTimeout(r, 20))
+  const after = await fresh.request({ type: "agent/state" })
+  assert.equal(after.session.status, "stopped", `stop left it as ${after.session.status}`)
+  assert.equal(after.session.queue.length, 0)
+})
+
+await test("stop always leaves a terminal status, live run or not", async () => {
+  /*
+   * The invariant that matters is not the particular label — an interrupted
+   * session is honestly "error", not "stopped" — but that the status is never
+   * left claiming work is in progress when nothing is happening, because that is
+   * the state where every prompt queues and Stop appears dead.
+   */
+  const storage = {
+    "webpilot.sessions": [
+      { tabId: 1, status: "working", messages: [], steps: [], turns: {}, queue: [] },
+    ],
+  }
+  const bg = loadBackground({ storage, hangingFetch: true })
+
+  await bg.request({ type: "agent/stop" })
+  const res = await bg.request({ type: "agent/state" })
+  assert.ok(
+    res.session.status !== "working" && res.session.status !== "waiting",
+    `stop left it claiming to be running: ${res.session.status}`,
+  )
+})
+
+await test("a new prompt runs rather than queueing behind a dead run", async () => {
+  const storage = { "webpilot.sessions": [{ tabId: 1, status: "working", messages: [], steps: [], turns: {}, queue: [] }] }
+  const bg = loadBackground({ storage, hangingFetch: true })
+  await bg.request({ type: "settings/set", patch: { endpoint: "https://x.test/v1", model: "m" } })
+
+  await bg.request({ type: "agent/run", prompt: "do it now" })
+  await new Promise((r) => setTimeout(r, 30))
+
+  const res = await bg.request({ type: "agent/state" })
+  // It must have started — the queue should be empty and it should be working.
+  assert.equal(res.session.queue.length, 0, `it was queued behind the dead run: ${JSON.stringify(res.session.queue)}`)
+  assert.equal(res.session.status, "working")
+})
+
 await test("a corrupt store does not stop the extension starting", async () => {
   // A bad value on disk must leave the extension working empty, not refusing to
   // load at all — there is nothing useful to do with it except ignore it.

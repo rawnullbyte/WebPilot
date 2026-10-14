@@ -108,20 +108,56 @@ export class Agent {
     if (!this.restoring) {
       this.restoring = (async () => {
         for (const stored of await loadSessions()) {
-          // A stored session holds only what is worth restoring; the live-only
-          // fields start clean, because nothing is streaming and no prompt is
-          // pending after a restart.
+          /*
+           * A stored "working" or "waiting" must never be restored as such.
+           *
+           * Those two statuses describe a *live* run: a controller that can be
+           * aborted, a model request in flight, a prompt awaiting an answer. None
+           * of that survives a restart, so restoring the status alone produces a
+           * session that claims to be running and is not. The consequences are
+           * all bad and all silent: `isRunning` stays true so every new prompt is
+           * queued behind a run that will never finish; `stop()` aborts a
+           * controller that is not there, so the Stop button does nothing; and
+           * the panel shows "Working…" with nothing streaming, indefinitely.
+           *
+           * The run was interrupted. Say so, and leave the session in a state
+           * the user can act from.
+           */
+          const interrupted = stored.status === 'working' || stored.status === 'waiting'
+
+          const steps = interrupted
+            ? [
+                ...stored.steps,
+                {
+                  id: `s${stored.tabId}_interrupted`,
+                  turn: 0,
+                  index: 0,
+                  at: Date.now(),
+                  kind: 'error' as const,
+                  title: 'Interrupted — the browser restarted WebPilot',
+                  detail:
+                    'The task stopped part-way. Nothing is running now; send a message to continue, or start over.',
+                  ok: false,
+                },
+              ]
+            : stored.steps
+
           this.sessions.set(stored.tabId, {
             tabId: stored.tabId,
-            status: stored.status,
+            status: interrupted ? 'error' : stored.status,
             messages: stored.messages,
-            steps: stored.steps,
+            steps,
             turns: stored.turns,
+            // Queued prompts are kept: the user asked for them, and they are
+            // visible with a way to remove each, so keeping them costs nothing.
+            // They are not started automatically — resuming automation the
+            // moment the browser comes back up would be a surprise, and the run
+            // would have no panel to report to or ask questions through.
             queue: stored.queue,
             question: null,
             approval: null,
             stream: { thinking: '', answer: '' },
-            note: stored.note,
+            note: interrupted ? 'Interrupted' : stored.note,
           })
         }
       })()
@@ -325,16 +361,36 @@ export class Agent {
    */
   stop(tabId: number): void {
     this.controllers.get(tabId)?.abort()
+
     /*
-     * Also drop anything queued. "Stop" means stop — leaving prompts to fire
+     * Drop anything queued. "Stop" means stop — leaving prompts to fire
      * afterwards would make the button appear not to have worked, which is a
      * nastier surprise than losing a queue you can retype.
      */
     const session = this.sessions.get(tabId)
-    if (session?.queue.length) {
-      session.queue = []
+    if (session?.queue.length) session.queue = []
+
+    /*
+     * Force the status to a terminal one, unconditionally.
+     *
+     * A stop that does not stop is the worst failure this class can have: the
+     * agent looks busy, nothing is happening, and the one control offered for it
+     * does nothing. If there was no live run to abort — an interrupted session,
+     * or a controller lost some other way — the abort above silently did
+     * nothing, so the status is cleared here instead of being left to whatever
+     * set it. Only a status that claims a run is in progress is cleared; a
+     * finished session keeps its outcome.
+     */
+    if (session && (session.status === 'working' || session.status === 'waiting')) {
+      session.question = null
+      session.approval = null
+      session.stream = { thinking: '', answer: '' }
+      this.emit(tabId, { kind: 'status', status: 'stopped', note: 'Stopped' })
+    } else if (session) {
       this.persist()
     }
+
+    this.draining.delete(tabId)
   }
 
   /* ---------------------------------------------------------------------- */
@@ -916,7 +972,13 @@ export class Agent {
 
       const id = `q${Date.now().toString(36)}`
       session.question = { id, text: question }
-      const answer = await this.asker.ask(tabId, id, question)
+      /*
+       * Raced against the abort. Without this, Stop during a question would do
+       * nothing visible: the loop is parked on the promise and would not notice
+       * until the five-minute prompt timeout, which is indistinguishable from
+       * being stuck.
+       */
+      const answer = await raceAbort(this.asker.ask(tabId, id, question), abort)
       session.question = null
       this.setStatus(session, 'working', 'Working')
 
@@ -993,10 +1055,14 @@ export class Agent {
 
       const action = describeAction(call.name, args, targetName)
       this.setStatus(session, 'waiting', 'Waiting for you')
-      const approved = await this.asker.approve(
-        tabId,
-        action,
-        risk.reason ?? 'Your approval mode asks before every action.',
+      // Raced against the abort, for the same reason as the question above.
+      const approved = await raceAbort(
+        this.asker.approve(
+          tabId,
+          action,
+          risk.reason ?? 'Your approval mode asks before every action.',
+        ),
+        abort,
       )
       this.setStatus(session, 'working', 'Working')
 
@@ -1264,6 +1330,32 @@ function prose0(content: string | null): boolean {
 function truncate(s: string, n: number): string {
   const collapsed = s.replace(/\s+/g, ' ').trim()
   return collapsed.length > n ? `${collapsed.slice(0, n - 1)}…` : collapsed
+}
+
+/**
+ * Resolves with `promise`, or rejects as soon as `abort` fires.
+ *
+ * Used for the waits that are not naturally abort-aware: an approval prompt, a
+ * question. Those are parked on a promise settled by a panel, so a stop would
+ * otherwise go unnoticed until the prompt timed out — minutes of an agent that
+ * looks stuck and ignores the button meant to unstick it.
+ */
+function raceAbort<T>(promise: Promise<T>, abort: AbortController): Promise<T> {
+  if (abort.signal.aborted) return Promise.reject(new LlmError('Stopped.'))
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new LlmError('Stopped.'))
+    abort.signal.addEventListener('abort', onAbort, { once: true })
+    promise.then(
+      (value) => {
+        abort.signal.removeEventListener('abort', onAbort)
+        resolve(value)
+      },
+      (err) => {
+        abort.signal.removeEventListener('abort', onAbort)
+        reject(err)
+      },
+    )
+  })
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
